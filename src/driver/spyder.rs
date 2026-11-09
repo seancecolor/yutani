@@ -99,10 +99,14 @@ pub struct XyzReading {
     pub y: f64,
     /// CIE Z tristimulus value (scaled in cd/m²).
     pub z: f64,
-    /// Raw 16-bit sensor channel counts (first 3 optical channels).
+    /// Raw 16-bit sensor channel counts (first 3 primary optical channels).
     pub raw_counts: [u16; 3],
+    /// Secondary 16-bit sensor channel counts (channels 3..6 on SpyderX2 / SpyderPro).
+    pub secondary_raw_counts: [u16; 3],
     /// Net counts after subtracting setup_off and black offset.
     pub net_counts: [f64; 3],
+    /// Number of hardware samples averaged into this reading.
+    pub sample_count: usize,
 }
 
 impl XyzReading {
@@ -113,6 +117,20 @@ impl XyzReading {
             (0.3127, 0.3290, 0.0)
         } else {
             (self.x / sum, self.y / sum, self.y)
+        }
+    }
+
+    /// Apply a 3x3 Colorimeter Correction Matrix (CCMX) to compensate for narrow-band
+    /// panel spectral power distributions (e.g., QD-OLED or W-LED IPS metameric shift).
+    pub fn apply_ccmx(&self, m: [[f64; 3]; 3]) -> Self {
+        let x = (m[0][0] * self.x + m[0][1] * self.y + m[0][2] * self.z).max(0.0);
+        let y = (m[1][0] * self.x + m[1][1] * self.y + m[1][2] * self.z).max(0.0);
+        let z = (m[2][0] * self.x + m[2][1] * self.y + m[2][2] * self.z).max(0.0);
+        Self {
+            x,
+            y,
+            z,
+            ..*self
         }
     }
 }
@@ -126,8 +144,10 @@ pub struct SpyderSession {
     pub firmware_version: String,
     pub serial_number: String,
     pub integration_ms: u16,
-    /// 3x3 sensor-to-XYZ calibration matrix (row-major: X, Y, Z).
+    /// Primary 3x3 sensor-to-XYZ calibration matrix (row-major: X, Y, Z).
     pub matrix: [[f64; 3]; 3],
+    /// Secondary 3x3 factory calibration matrix (bytes 51..87 on SpyderX2 / SpyderPro).
+    pub secondary_matrix: [[f64; 3]; 3],
     pub gain: [f64; 3],
     pub offset: [f64; 3],
     /// Pre-built measurement command frame (`d2 ...` or `f2 ...`).
@@ -135,6 +155,8 @@ pub struct SpyderSession {
     measure_resp_len: usize,
     /// Per-channel baseline offset returned by `setup(v1)`.
     pub setup_off: [f64; 3],
+    /// Secondary channel baseline offsets returned by `setup(v1)` on SpyderX2 / SpyderPro.
+    pub secondary_setup_off: [f64; 3],
     /// Measured dark-current calibration offset (`bcal`, with lens cap on).
     pub black_off: [f64; 3],
     /// Whether `calibrate_black` (`bcal`) has been performed in this session.
@@ -161,14 +183,15 @@ impl SpyderSession {
             let cal = transact(&handle, &cal_cmd, cmd_set.cal_resp_len())
                 .context("factory calibration read failed")?;
 
-            let (v1, integration_ms, matrix, gain, offset) = parse_calibration(cmd_set, &cal)?;
+            let (v1, integration_ms, matrix, secondary_matrix, gain, offset) =
+                parse_calibration(cmd_set, &cal)?;
 
             // Run sensor setup(v1)
             let setup_cmd = cmd_set.setup_cmd(v1);
             let setup = transact(&handle, &setup_cmd, cmd_set.setup_resp_len())
                 .context("sensor setup(v1) failed")?;
 
-            let (measure_cmd, measure_resp_len, setup_off) =
+            let (measure_cmd, measure_resp_len, setup_off, secondary_setup_off) =
                 build_measure_frame(cmd_set, integration_ms, &setup)?;
 
             tracing::info!(
@@ -192,11 +215,13 @@ impl SpyderSession {
                 serial_number,
                 integration_ms,
                 matrix,
+                secondary_matrix,
                 gain,
                 offset,
                 measure_cmd,
                 measure_resp_len,
                 setup_off,
+                secondary_setup_off,
                 black_off: [0.0; 3],
                 black_calibrated: false,
             });
@@ -265,6 +290,7 @@ impl SpyderSession {
         }
 
         let mut raw_counts = [0u16; 3];
+        let mut secondary_raw_counts = [0u16; 3];
         let mut net_counts = [0.0f64; 3];
         let mut calibrated_ch = [0.0f64; 3];
 
@@ -281,6 +307,12 @@ impl SpyderSession {
                 1.0
             };
             calibrated_ch[i] = (net / g) + self.offset[i];
+        }
+
+        if resp.len() >= 17 {
+            for i in 0..3 {
+                secondary_raw_counts[i] = u16::from_be_bytes([resp[11 + i * 2], resp[12 + i * 2]]);
+            }
         }
 
         let x = (self.matrix[0][0] * calibrated_ch[0]
@@ -301,7 +333,9 @@ impl SpyderSession {
             y,
             z,
             raw_counts,
+            secondary_raw_counts,
             net_counts,
+            sample_count: 1,
         })
     }
 }
@@ -330,7 +364,7 @@ fn read_f32_le(bytes: &[u8], offset: usize) -> f64 {
 fn parse_calibration(
     cmd_set: CmdSet,
     cal: &[u8],
-) -> Result<(u8, u16, [[f64; 3]; 3], [f64; 3], [f64; 3])> {
+) -> Result<(u8, u16, [[f64; 3]; 3], [[f64; 3]; 3], [f64; 3], [f64; 3])> {
     match cmd_set {
         CmdSet::SpyderX2 => {
             if cal.len() < 113 {
@@ -340,10 +374,13 @@ fn parse_calibration(
             let v2 = u16::from_be_bytes([cal[7], cal[8]]);
             // 9 IEEE754 LE floats starting at byte 15 (after 5B header + 1B idx + 1B v1 + 2B v2 + 6B chan map)
             let mut matrix = [[0.0f64; 3]; 3];
+            let mut secondary_matrix = [[0.0f64; 3]; 3];
             for r in 0..3 {
                 for c in 0..3 {
                     let idx = 15 + (r * 3 + c) * 4;
                     matrix[r][c] = read_f32_le(cal, idx);
+                    let sec_idx = 51 + (r * 3 + c) * 4;
+                    secondary_matrix[r][c] = read_f32_le(cal, sec_idx);
                 }
             }
             // 3 (gain, off) pairs starting at byte 87
@@ -353,7 +390,7 @@ fn parse_calibration(
                 gain[i] = read_f32_le(cal, 87 + i * 8);
                 offset[i] = read_f32_le(cal, 87 + i * 8 + 4);
             }
-            Ok((v1, v2, matrix, gain, offset))
+            Ok((v1, v2, matrix, secondary_matrix, gain, offset))
         }
         CmdSet::SpyderX => {
             if cal.len() < 47 {
@@ -368,7 +405,7 @@ fn parse_calibration(
                     matrix[r][c] = read_f32_le(cal, idx);
                 }
             }
-            Ok((v1, v2, matrix, [1.0; 3], [0.0; 3]))
+            Ok((v1, v2, matrix, matrix, [1.0; 3], [0.0; 3]))
         }
     }
 }
@@ -377,7 +414,7 @@ fn build_measure_frame(
     cmd_set: CmdSet,
     v2: u16,
     setup: &[u8],
-) -> Result<(Vec<u8>, usize, [f64; 3])> {
+) -> Result<(Vec<u8>, usize, [f64; 3], [f64; 3])> {
     match cmd_set {
         CmdSet::SpyderX2 => {
             if setup.len() < 27 {
@@ -391,7 +428,12 @@ fn build_measure_frame(
                 setup[21] as f64,
                 setup[22] as f64,
             ];
-            Ok((cmd, 17, setup_off))
+            let secondary_setup_off = [
+                setup[23] as f64,
+                setup[24] as f64,
+                setup[25] as f64,
+            ];
+            Ok((cmd, 17, setup_off, secondary_setup_off))
         }
         CmdSet::SpyderX => {
             if setup.len() < 15 {
@@ -406,7 +448,7 @@ fn build_measure_frame(
                 setup[11] as f64,
                 setup[12] as f64,
             ];
-            Ok((cmd, 13, setup_off))
+            Ok((cmd, 13, setup_off, [0.0; 3]))
         }
     }
 }
@@ -529,15 +571,25 @@ pub fn probe() -> Result<()> {
                 let cal = transact(&handle, &cal_cmd, cmd_set.cal_resp_len())?;
                 hexdump(&format!("← EP {EP_IN:#04x} factory calibration"), &cal);
 
-                let (v1, v2, matrix, gain, offset) = parse_calibration(cmd_set, &cal)?;
+                let (v1, v2, matrix, secondary_matrix, gain, offset) =
+                    parse_calibration(cmd_set, &cal)?;
                 println!("Decoded Factory Calibration:");
                 println!("  v1 = {v1:#04x}, v2 (integration) = {v2} ms");
-                println!("  3x3 Matrix (sensor -> XYZ):");
+                println!("  Primary 3x3 Matrix (sensor -> XYZ):");
                 for (row_label, row) in ["X", "Y", "Z"].iter().zip(matrix.iter()) {
                     println!(
                         "    {row_label}: [{:+.8}, {:+.8}, {:+.8}]",
                         row[0], row[1], row[2]
                     );
+                }
+                if cmd_set == CmdSet::SpyderX2 {
+                    println!("  Secondary 3x3 Matrix (bytes 51..87):");
+                    for (row_label, row) in ["X", "Y", "Z"].iter().zip(secondary_matrix.iter()) {
+                        println!(
+                            "    {row_label}: [{:+.8}, {:+.8}, {:+.8}]",
+                            row[0], row[1], row[2]
+                        );
+                    }
                 }
                 println!("  Gain:   {gain:?}");
                 println!("  Offset: {offset:?}\n");
@@ -547,9 +599,9 @@ pub fn probe() -> Result<()> {
                 let setup = transact(&handle, &setup_cmd, cmd_set.setup_resp_len())?;
                 hexdump(&format!("← EP {EP_IN:#04x} setup read"), &setup);
 
-                let (meas_cmd, meas_resp_len, setup_off) =
+                let (meas_cmd, meas_resp_len, setup_off, sec_setup_off) =
                     build_measure_frame(cmd_set, v2, &setup)?;
-                println!("  setup_off: {setup_off:?}\n");
+                println!("  setup_off: {setup_off:?} (secondary: {sec_setup_off:?})\n");
 
                 reset(&handle)?;
                 hexdump(&format!("→ EP {EP_OUT:#04x} measure write"), &meas_cmd);
@@ -557,11 +609,17 @@ pub fn probe() -> Result<()> {
                 hexdump(&format!("← EP {EP_IN:#04x} measure read"), &meas);
 
                 let mut raw = [0u16; 3];
+                let mut sec_raw = [0u16; 3];
                 let mut ch = [0.0f64; 3];
                 for i in 0..3 {
                     raw[i] = u16::from_be_bytes([meas[5 + i * 2], meas[6 + i * 2]]);
                     let net = (raw[i] as f64 - setup_off[i]).max(0.0);
                     ch[i] = net / gain[i] + offset[i];
+                }
+                if meas.len() >= 17 {
+                    for i in 0..3 {
+                        sec_raw[i] = u16::from_be_bytes([meas[11 + i * 2], meas[12 + i * 2]]);
+                    }
                 }
                 let x = (matrix[0][0] * ch[0] + matrix[0][1] * ch[1] + matrix[0][2] * ch[2]).max(0.0);
                 let y = (matrix[1][0] * ch[0] + matrix[1][1] * ch[1] + matrix[1][2] * ch[2]).max(0.0);
@@ -571,11 +629,13 @@ pub fn probe() -> Result<()> {
                     y,
                     z,
                     raw_counts: raw,
+                    secondary_raw_counts: sec_raw,
                     net_counts: ch,
+                    sample_count: 1,
                 };
                 let (cx, cy, lum) = reading.to_xyy();
                 println!(
-                    "📊 Sample Reading: raw={raw:?} -> XYZ=({x:.4}, {y:.4}, {z:.4}) | xyY=({cx:.4}, {cy:.4}, {lum:.3} cd/m²)"
+                    "📊 Sample Reading: raw={raw:?} (sec={sec_raw:?}) -> XYZ=({x:.4}, {y:.4}, {z:.4}) | xyY=({cx:.4}, {cy:.4}, {lum:.3} cd/m²)"
                 );
 
                 return Ok(());

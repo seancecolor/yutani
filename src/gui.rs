@@ -5,8 +5,9 @@ use eframe::egui;
 
 use crate::driver::spyder::{SpyderSession, XyzReading};
 use crate::icc::{
-    bt1886_params, eotf_target_luminance, generate_profile_from_measurements,
-    CalibrationMeasurements, ColorGamut, DisplayTarget, EotfConfig, VcgtSummary,
+    bt1886_params, eotf_target_luminance, evaluate_verification_patch_de00,
+    generate_profile_from_measurements, CalibrationMeasurements, ColorGamut, DisplayTarget,
+    EotfConfig, VcgtSummary, VerificationPatchReading,
 };
 
 /// Duration of the Yutani CRT terminal startup sequence.
@@ -86,6 +87,44 @@ fn configure_yutani_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// Selectable patch sequence density preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PatchPreset {
+    /// 14 patches: Black, White, R/G/B primaries, and 9 linear grayscale steps (10%..90%).
+    Standard14,
+    /// 33 patches: Dense shadow toe (2%, 4%, 6%, 8%), highlight shoulder (95%, 98%),
+    /// and 4-step separate R, G, B primary sub-ramps (20%, 40%, 60%, 80%).
+    #[default]
+    Extended33,
+    /// 54 patches: Full 18-step grayscale + 5-step R/G/B primary sub-ramps +
+    /// R/G/B/C/M/Y saturation sweeps (25%, 50%, 75%) + ColorChecker verification patches.
+    Studio54,
+}
+
+impl PatchPreset {
+    pub const ALL: [PatchPreset; 3] = [
+        PatchPreset::Standard14,
+        PatchPreset::Extended33,
+        PatchPreset::Studio54,
+    ];
+
+    pub fn button_label(self) -> &'static str {
+        match self {
+            Self::Standard14 => " [ 14-PATCH FAST ] ",
+            Self::Extended33 => " [ 33-PATCH PRECISION (TOE/SHOULDER + RGB RAMPS) ] ",
+            Self::Studio54 => " [ 54-PATCH STUDIO (+ SATURATION & COLORCHECKER) ] ",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Standard14 => "14-PATCH FAST",
+            Self::Extended33 => "33-PATCH PRECISION",
+            Self::Studio54 => "54-PATCH STUDIO",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PatchSpec {
     label: &'static str,
@@ -101,56 +140,160 @@ enum PatchKind {
     Green,
     Blue,
     Gray(f64),
+    /// Separate per-channel sub-ramp patch (`channel`: 0=R, 1=G, 2=B; `level` in `0.0..=1.0`).
+    PrimaryRamp { channel: usize, level: f64 },
+    /// Saturation sweep or ColorChecker verification patch with normalized `[R, G, B]` stimulus.
+    Verification {
+        label: &'static str,
+        stimulus_rgb: [f64; 3],
+    },
 }
 
-fn build_calibration_patches() -> Vec<PatchSpec> {
+fn build_calibration_patches(preset: PatchPreset) -> Vec<PatchSpec> {
     let mut patches = vec![
         PatchSpec {
-            label: "01 // BLACK LEVEL (0%)",
+            label: "BLACK LEVEL (0%)",
             color: egui::Color32::from_rgb(0, 0, 0),
             kind: PatchKind::Black,
         },
         PatchSpec {
-            label: "02 // PEAK WHITE (100%)",
+            label: "PEAK WHITE (100%)",
             color: egui::Color32::from_rgb(255, 255, 255),
             kind: PatchKind::White,
         },
         PatchSpec {
-            label: "03 // RED PRIMARY",
+            label: "RED PRIMARY (100%)",
             color: egui::Color32::from_rgb(255, 0, 0),
             kind: PatchKind::Red,
         },
         PatchSpec {
-            label: "04 // GREEN PRIMARY",
+            label: "GREEN PRIMARY (100%)",
             color: egui::Color32::from_rgb(0, 255, 0),
             kind: PatchKind::Green,
         },
         PatchSpec {
-            label: "05 // BLUE PRIMARY",
+            label: "BLUE PRIMARY (100%)",
             color: egui::Color32::from_rgb(0, 0, 255),
             kind: PatchKind::Blue,
         },
     ];
 
-    let gray_steps: [f64; 9] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
-    for (idx, &v) in gray_steps.iter().enumerate() {
+    // 1. Grayscale steps: Standard 9-step vs Dense 16-step (with 2%, 4%, 6%, 8% shadow toe & 95%, 98% shoulder)
+    let gray_steps: &[(&'static str, f64)] = match preset {
+        PatchPreset::Standard14 => &[
+            ("GRAY 10%", 0.10),
+            ("GRAY 20%", 0.20),
+            ("GRAY 30%", 0.30),
+            ("GRAY 40%", 0.40),
+            ("GRAY 50%", 0.50),
+            ("GRAY 60%", 0.60),
+            ("GRAY 70%", 0.70),
+            ("GRAY 80%", 0.80),
+            ("GRAY 90%", 0.90),
+        ],
+        PatchPreset::Extended33 | PatchPreset::Studio54 => &[
+            ("GRAY 02% (SHADOW TOE)", 0.02),
+            ("GRAY 04% (SHADOW TOE)", 0.04),
+            ("GRAY 06% (SHADOW TOE)", 0.06),
+            ("GRAY 08% (SHADOW TOE)", 0.08),
+            ("GRAY 10%", 0.10),
+            ("GRAY 15%", 0.15),
+            ("GRAY 20%", 0.20),
+            ("GRAY 30%", 0.30),
+            ("GRAY 40%", 0.40),
+            ("GRAY 50%", 0.50),
+            ("GRAY 60%", 0.60),
+            ("GRAY 70%", 0.70),
+            ("GRAY 80%", 0.80),
+            ("GRAY 90%", 0.90),
+            ("GRAY 95% (SHOULDER)", 0.95),
+            ("GRAY 98% (SHOULDER)", 0.98),
+        ],
+    };
+
+    for &(label, v) in gray_steps {
         let level = (v * 255.0).round() as u8;
-        let label: &'static str = match idx {
-            0 => "06 // GRAY 10%",
-            1 => "07 // GRAY 20%",
-            2 => "08 // GRAY 30%",
-            3 => "09 // GRAY 40%",
-            4 => "10 // GRAY 50%",
-            5 => "11 // GRAY 60%",
-            6 => "12 // GRAY 70%",
-            7 => "13 // GRAY 80%",
-            _ => "14 // GRAY 90%",
-        };
         patches.push(PatchSpec {
             label,
             color: egui::Color32::from_rgb(level, level, level),
             kind: PatchKind::Gray(v),
         });
+    }
+
+    // 2. Separate R, G, B Primary Sub-Ramps (20%, 40%, 60%, 80%)
+    if matches!(preset, PatchPreset::Extended33 | PatchPreset::Studio54) {
+        let sub_ramps: &[(&'static str, usize, f64)] = &[
+            ("RED SUB-RAMP 20%", 0, 0.20),
+            ("RED SUB-RAMP 40%", 0, 0.40),
+            ("RED SUB-RAMP 60%", 0, 0.60),
+            ("RED SUB-RAMP 80%", 0, 0.80),
+            ("GREEN SUB-RAMP 20%", 1, 0.20),
+            ("GREEN SUB-RAMP 40%", 1, 0.40),
+            ("GREEN SUB-RAMP 60%", 1, 0.60),
+            ("GREEN SUB-RAMP 80%", 1, 0.80),
+            ("BLUE SUB-RAMP 20%", 2, 0.20),
+            ("BLUE SUB-RAMP 40%", 2, 0.40),
+            ("BLUE SUB-RAMP 60%", 2, 0.60),
+            ("BLUE SUB-RAMP 80%", 2, 0.80),
+        ];
+        for &(label, ch, level) in sub_ramps {
+            let u = (level * 255.0).round() as u8;
+            let color = match ch {
+                0 => egui::Color32::from_rgb(u, 0, 0),
+                1 => egui::Color32::from_rgb(0, u, 0),
+                _ => egui::Color32::from_rgb(0, 0, u),
+            };
+            patches.push(PatchSpec {
+                label,
+                color,
+                kind: PatchKind::PrimaryRamp { channel: ch, level },
+            });
+        }
+    }
+
+    // 3. Saturation Sweeps (25%, 50%, 75%) & ColorChecker Verification Patches
+    if matches!(preset, PatchPreset::Studio54) {
+        let verif_specs: &[(&'static str, [u8; 3])] = &[
+            // Primary & Secondary Saturation / Luminance Sweeps
+            ("SAT RED 50% (R+W MIX)", [255, 128, 128]),
+            ("SAT GREEN 50% (G+W MIX)", [128, 255, 128]),
+            ("SAT BLUE 50% (B+W MIX)", [128, 128, 255]),
+            ("CYAN SECONDARY 100%", [0, 255, 255]),
+            ("CYAN SAT 50%", [128, 255, 255]),
+            ("CYAN DRIVE 50%", [0, 128, 128]),
+            ("MAGENTA SECONDARY 100%", [255, 0, 255]),
+            ("MAGENTA SAT 50%", [255, 128, 255]),
+            ("MAGENTA DRIVE 50%", [128, 0, 128]),
+            ("YELLOW SECONDARY 100%", [255, 255, 0]),
+            ("YELLOW SAT 50%", [255, 255, 128]),
+            ("YELLOW DRIVE 50%", [128, 128, 0]),
+            // Classic ColorChecker Reference Patches (sRGB 8-bit)
+            ("CC01 // DARK SKIN", [115, 82, 68]),
+            ("CC02 // LIGHT SKIN", [194, 150, 130]),
+            ("CC03 // BLUE SKY", [98, 122, 157]),
+            ("CC04 // FOLIAGE", [87, 108, 67]),
+            ("CC05 // BLUE FLOWER", [133, 128, 177]),
+            ("CC06 // BLUISH GREEN", [103, 189, 170]),
+            ("CC07 // ORANGE", [214, 126, 44]),
+            ("CC12 // ORANGE YELLOW", [224, 163, 46]),
+            ("CC18 // CYAN", [8, 133, 161]),
+        ];
+
+        for &(label, rgb) in verif_specs {
+            let stimulus_rgb = [
+                rgb[0] as f64 / 255.0,
+                rgb[1] as f64 / 255.0,
+                rgb[2] as f64 / 255.0,
+            ];
+            patches.push(PatchSpec {
+                label,
+                color: egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                kind: PatchKind::Verification {
+                    label,
+                    stimulus_rgb,
+                },
+            });
+        }
     }
 
     patches
@@ -336,6 +479,32 @@ fn draw_eotf_graph(
             }
             for pt in meas_pts {
                 painter.circle_filled(pt, 3.0, meas_cyan);
+            }
+        }
+
+        // 3. Optional separate R, G, B primary sub-ramp curves
+        let prim_peaks = [
+            (measurements.red.y - lb).max(1e-6),
+            (measurements.green.y - lb).max(1e-6),
+            (measurements.blue.y - lb).max(1e-6),
+        ];
+        let prim_colors = [
+            egui::Color32::from_rgba_unmultiplied(245, 75, 65, 190),
+            egui::Color32::from_rgba_unmultiplied(75, 230, 95, 190),
+            egui::Color32::from_rgba_unmultiplied(85, 155, 255, 190),
+        ];
+        for c in 0..3 {
+            if !measurements.primary_ramps[c].is_empty() {
+                let mut ch_pts = Vec::with_capacity(measurements.primary_ramps[c].len() + 2);
+                ch_pts.push(to_screen(0.0, 0.0));
+                for &(u, ref r) in &measurements.primary_ramps[c] {
+                    let y_norm = ((r.y - lb).max(0.0) / prim_peaks[c]).clamp(0.0, 1.0);
+                    ch_pts.push(to_screen(u, y_norm));
+                }
+                ch_pts.push(to_screen(1.0, 1.0));
+                for win in ch_pts.windows(2) {
+                    painter.line_segment([win[0], win[1]], egui::Stroke::new(1.1_f32, prim_colors[c]));
+                }
             }
         }
 
@@ -596,6 +765,32 @@ fn draw_cie_gamut_graph(
         }
         for &(_v, pt) in &gray_screen_pts {
             painter.circle_filled(pt, 2.2, gray_dot);
+        }
+
+        // 6. Plot separate R, G, B sub-ramp chromaticity points and Verification / ColorChecker patches
+        let sub_colors = [
+            egui::Color32::from_rgb(245, 95, 85),
+            egui::Color32::from_rgb(85, 235, 105),
+            egui::Color32::from_rgb(95, 165, 255),
+        ];
+        for c in 0..3 {
+            for &(_u, ref r) in &measurements.primary_ramps[c] {
+                let (px, py, plum) = r.to_xyy();
+                if plum > 0.05 && px > 0.01 && py > 0.01 {
+                    painter.circle_filled(to_screen(px, py), 2.3, sub_colors[c]);
+                }
+            }
+        }
+        for verif in &measurements.verification {
+            let (vx, vy, vlum) = verif.reading.to_xyy();
+            if vlum > 0.05 && vx > 0.01 && vy > 0.01 {
+                let v_pt = to_screen(vx, vy);
+                painter.circle_stroke(
+                    v_pt,
+                    2.8,
+                    egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(235, 130, 255)),
+                );
+            }
         }
 
         // Peak White (100%) outer ring marker
@@ -1076,6 +1271,8 @@ struct YutaniApp {
     display_target: DisplayTarget,
     color_gamut: ColorGamut,
     eotf: EotfConfig,
+    patch_preset: PatchPreset,
+    oled_windowed_apl: bool,
     target_nits: f64,
     phase: AppPhase,
     theme_applied: bool,
@@ -1091,6 +1288,8 @@ impl YutaniApp {
             display_target: default_display,
             color_gamut: ColorGamut::default(),
             eotf: EotfConfig::default(),
+            patch_preset: PatchPreset::default(),
+            oled_windowed_apl: default_display.is_oled(),
             target_nits: default_display.default_target_nits(),
             phase: AppPhase::BootSequence {
                 started_at: Instant::now(),
@@ -1136,6 +1335,9 @@ impl YutaniApp {
         let mut green = XyzReading::default();
         let mut blue = XyzReading::default();
         let mut grayscale = Vec::new();
+        let mut primary_ramps: [Vec<(f64, XyzReading)>; 3] =
+            [Vec::new(), Vec::new(), Vec::new()];
+        let mut verification = Vec::new();
 
         for (spec, reading) in readings {
             match spec.kind {
@@ -1151,10 +1353,28 @@ impl YutaniApp {
                 PatchKind::Green => green = reading,
                 PatchKind::Blue => blue = reading,
                 PatchKind::Gray(v) => grayscale.push((v, reading)),
+                PatchKind::PrimaryRamp { channel, level } => {
+                    if channel < 3 {
+                        primary_ramps[channel].push((level, reading));
+                    }
+                }
+                PatchKind::Verification {
+                    label,
+                    stimulus_rgb,
+                } => {
+                    verification.push(VerificationPatchReading {
+                        label,
+                        stimulus_rgb,
+                        reading,
+                    });
+                }
             }
         }
 
         grayscale.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for ch_ramp in &mut primary_ramps {
+            ch_ramp.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        }
 
         let measurements = CalibrationMeasurements {
             black,
@@ -1163,6 +1383,8 @@ impl YutaniApp {
             green,
             blue,
             grayscale,
+            primary_ramps,
+            verification,
         };
 
         match generate_profile_from_measurements(
@@ -1208,6 +1430,8 @@ impl eframe::App for YutaniApp {
         let current_eotf = self.eotf;
         let current_display = self.display_target;
         let current_gamut = self.color_gamut;
+        let current_preset = self.patch_preset;
+        let current_windowed_apl = self.oled_windowed_apl;
 
         match &mut self.phase {
             AppPhase::BootSequence { started_at } => {
@@ -1256,6 +1480,7 @@ impl eframe::App for YutaniApp {
                             if ui.selectable_label(is_sel, target.button_label()).clicked() {
                                 self.display_target = target;
                                 self.target_nits = target.default_target_nits();
+                                self.oled_windowed_apl = target.is_oled();
                             }
                         }
                     });
@@ -1269,6 +1494,23 @@ impl eframe::App for YutaniApp {
                                 self.color_gamut = gamut;
                             }
                         }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.label("SELECT CALIBRATION PATCH SUITE & OLED APL MODE:");
+                    ui.horizontal_wrapped(|ui| {
+                        for preset in PatchPreset::ALL {
+                            let is_sel = self.patch_preset == preset;
+                            if ui.selectable_label(is_sel, preset.button_label()).clicked() {
+                                self.patch_preset = preset;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.oled_windowed_apl,
+                            "10% Windowed Patch + 20% Neutral Gray APL Stabilizer (Prevents OLED ABL Dimming)",
+                        );
                     });
 
                     ui.add_space(6.0);
@@ -1531,7 +1773,13 @@ impl eframe::App for YutaniApp {
                                 if ui.button(" [ LIVE OSD WHITE & NITS METER (O) ] ").clicked() {
                                     launch_osd = true;
                                 }
-                                if ui.button(" [ ENGAGE 14-PATCH SEQUENCE (SPACE) ] ").clicked() {
+                                if ui
+                                    .button(format!(
+                                        " [ ENGAGE {} SEQUENCE (SPACE) ] ",
+                                        current_preset.short_label()
+                                    ))
+                                    .clicked()
+                                {
                                     begin_sequence = true;
                                 }
                                 if ui.button(" [ ABORT (ESC) ] ").clicked() {
@@ -1553,12 +1801,14 @@ impl eframe::App for YutaniApp {
                     };
                     ctx.request_repaint();
                 } else if begin_sequence {
+                    let patches = build_calibration_patches(current_preset);
+                    let cap = patches.len();
                     self.phase = AppPhase::Measuring {
-                        patches: build_calibration_patches(),
+                        patches,
                         current_index: 0,
                         patch_shown_at: Instant::now(),
                         awaiting_read: false,
-                        readings: Vec::with_capacity(14),
+                        readings: Vec::with_capacity(cap),
                     };
                     ctx.request_repaint();
                 }
@@ -1713,7 +1963,10 @@ impl eframe::App for YutaniApp {
                                     trigger_manual_read = true;
                                 }
                                 if ui
-                                    .button(" [ START 14-PATCH CALIBRATION (SPACE) ] ")
+                                    .button(format!(
+                                        " [ START {} CALIBRATION (SPACE) ] ",
+                                        current_preset.short_label()
+                                    ))
                                     .clicked()
                                 {
                                     proceed_to_cal = true;
@@ -1729,12 +1982,14 @@ impl eframe::App for YutaniApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     self.phase = AppPhase::Dashboard;
                 } else if proceed_to_cal {
+                    let patches = build_calibration_patches(current_preset);
+                    let cap = patches.len();
                     self.phase = AppPhase::Measuring {
-                        patches: build_calibration_patches(),
+                        patches,
                         current_index: 0,
                         patch_shown_at: Instant::now(),
                         awaiting_read: false,
-                        readings: Vec::with_capacity(14),
+                        readings: Vec::with_capacity(cap),
                     };
                     ctx.request_repaint();
                 } else if (!*paused && last_poll.elapsed() >= OSD_POLL_INTERVAL)
@@ -1765,20 +2020,40 @@ impl eframe::App for YutaniApp {
             } => {
                 let spec = patches[*current_index];
 
-                // Fill entire screen with the active calibration patch color
+                // When OLED Windowed APL mode is active, surround a 10% center patch window (360x360)
+                // with a constant ~20% APL neutral gray surround (RGB 118, 118, 118) so OLED/QD-OLED
+                // Auto Brightness Limiter (ABL) stays locked across all patches.
+                let bg_fill = if current_windowed_apl {
+                    egui::Color32::from_rgb(118, 118, 118)
+                } else {
+                    spec.color
+                };
+
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::default().fill(spec.color))
+                    .frame(egui::Frame::default().fill(bg_fill))
                     .show(ctx, |ui| {
+                        if current_windowed_apl {
+                            let center = ui.max_rect().center();
+                            let patch_rect =
+                                egui::Rect::from_center_size(center, egui::vec2(360.0, 360.0));
+                            ui.painter().rect_filled(patch_rect, 0.0, spec.color);
+                        }
+
                         // Small top-left corner status outside the center sensor zone
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200))
                             .inner_margin(8.0)
                             .show(ui, |ui| {
                                 ui.label(format!(
-                                    "YUTANI // PATCH {}/{} : {}  [ESC TO ABORT]",
+                                    "YUTANI // PATCH {}/{} : {} [{}]  [ESC TO ABORT]",
                                     *current_index + 1,
                                     patches.len(),
-                                    spec.label
+                                    spec.label,
+                                    if current_windowed_apl {
+                                        "10% WINDOWED APL"
+                                    } else {
+                                        "FULLSCREEN"
+                                    }
                                 ));
                             });
                     });
@@ -1883,7 +2158,7 @@ impl eframe::App for YutaniApp {
                             err_b
                         ));
                         ui.label(format!(
-                            "D65 VCGT GAINS  : R = {:.1}% | G = {:.1}% | B = {:.1}% (Inversion: {})",
+                            "D65 VCGT GAINS  : R = {:.1}% | G = {:.1}% | B = {:.1}% (Inversion: {} // RGB Sub-Ramps: {})",
                             vcgt_summary.d65_rgb_gains[0] * 100.0,
                             vcgt_summary.d65_rgb_gains[1] * 100.0,
                             vcgt_summary.d65_rgb_gains[2] * 100.0,
@@ -1891,6 +2166,11 @@ impl eframe::App for YutaniApp {
                                 "ACTIVE"
                             } else {
                                 "BASELINE FALLBACK"
+                            },
+                            if vcgt_summary.used_rgb_subramps {
+                                "BLENDED"
+                            } else {
+                                "GRAY-ONLY"
                             }
                         ));
                         ui.label(format!(
@@ -1945,6 +2225,68 @@ impl eframe::App for YutaniApp {
                                 b_8bit,
                                 b_8bit - in_8bit,
                             ));
+                        }
+
+                        if measurements.primary_ramps.iter().any(|r| !r.is_empty()) {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label("PER-CHANNEL PRIMARY SUB-RAMP TELEMETRY (R / G / B EOTF):");
+                            let ch_names = ["RED  ", "GREEN", "BLUE "];
+                            let peak_ch = [
+                                measurements.red.y.max(1e-6),
+                                measurements.green.y.max(1e-6),
+                                measurements.blue.y.max(1e-6),
+                            ];
+                            for c in 0..3 {
+                                for &(u, ref r) in &measurements.primary_ramps[c] {
+                                    let (px, py, plum) = r.to_xyy();
+                                    let rel_pct = ((plum - lb).max(0.0) / (peak_ch[c] - lb).max(1e-6)) * 100.0;
+                                    ui.monospace(format!(
+                                        "  {} {:>3.0}% | Lum: {:>6.2} cd/m² ({:>5.1}% of ch peak) | CIE xy = ({:.4}, {:.4})",
+                                        ch_names[c],
+                                        u * 100.0,
+                                        plum,
+                                        rel_pct,
+                                        px,
+                                        py
+                                    ));
+                                }
+                            }
+                        }
+
+                        if !measurements.verification.is_empty() {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            let mut sum_de00 = 0.0f64;
+                            let mut max_de00 = 0.0f64;
+                            let mut rows = Vec::with_capacity(measurements.verification.len());
+                            for vpatch in &measurements.verification {
+                                let (de00, tgt_xy) = evaluate_verification_patch_de00(
+                                    vpatch,
+                                    measurements,
+                                    current_gamut,
+                                    current_eotf,
+                                );
+                                sum_de00 += de00;
+                                if de00 > max_de00 {
+                                    max_de00 = de00;
+                                }
+                                rows.push((vpatch, de00, tgt_xy));
+                            }
+                            let mean_de00 = sum_de00 / (rows.len() as f64);
+                            ui.label(format!(
+                                "SATURATION SWEEP & COLORCHECKER VERIFICATION ({} PATCHES) // MEAN ΔE00 = {:.2} | MAX ΔE00 = {:.2}:",
+                                rows.len(),
+                                mean_de00,
+                                max_de00
+                            ));
+                            for (vpatch, de00, tgt_xy) in rows {
+                                let (mx, my, mlum) = vpatch.reading.to_xyy();
+                                ui.monospace(format!(
+                                    "  {:<26} | Lum: {:>6.2} cd/m² | Meas xy:({:.4},{:.4}) vs Tgt:({:.4},{:.4}) | ΔE00 = {:>5.2}",
+                                    vpatch.label, mlum, mx, my, tgt_xy.0, tgt_xy.1, de00
+                                ));
+                            }
                         }
 
                         ui.add_space(8.0);

@@ -79,6 +79,12 @@ impl DisplayTarget {
             Self::Pa279Crv => 0.10,
         }
     }
+
+    /// Returns `true` for self-emissive OLED / QD-OLED panels that benefit from
+    /// 10% windowed APL-stabilized patch rendering to avoid Auto Brightness Limiter (ABL).
+    pub fn is_oled(self) -> bool {
+        matches!(self, Self::Pa32Ucdm | Self::Mq16Ahe)
+    }
 }
 
 /// Target color gamut space for calibration and ICC profile primary metadata.
@@ -210,6 +216,15 @@ impl EotfConfig {
     }
 }
 
+/// A measured saturation sweep or ColorChecker verification patch.
+#[derive(Clone, Debug)]
+pub struct VerificationPatchReading {
+    pub label: &'static str,
+    /// Normalized `[R, G, B]` stimulus in `[0.0, 1.0]`.
+    pub stimulus_rgb: [f64; 3],
+    pub reading: XyzReading,
+}
+
 /// Complete set of patch measurements captured during a calibration run.
 #[derive(Clone, Debug)]
 pub struct CalibrationMeasurements {
@@ -220,6 +235,10 @@ pub struct CalibrationMeasurements {
     pub blue: XyzReading,
     /// `(stimulus_0_to_1, reading)` pairs across the grayscale ramp.
     pub grayscale: Vec<(f64, XyzReading)>,
+    /// Optional separate per-channel R, G, B primary sub-ramps `(stimulus_0_to_1, reading)`.
+    pub primary_ramps: [Vec<(f64, XyzReading)>; 3],
+    /// Optional saturation sweep & ColorChecker verification patches.
+    pub verification: Vec<VerificationPatchReading>,
 }
 
 /// Compute BT.1886 parameters `(a, b)` for a given white/black luminance (cd/m²) and gamma.
@@ -295,6 +314,8 @@ pub struct VcgtSummary {
     pub lut_curves: [Vec<f64>; 3],
     /// Whether real optical measurements were used to invert the panel's native response.
     pub used_measured_inversion: bool,
+    /// Whether separate R, G, B sub-ramp measurements were blended into the per-channel EOTF solver.
+    pub used_rgb_subramps: bool,
 }
 
 impl VcgtSummary {
@@ -349,6 +370,33 @@ fn mat_vec_mul(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
         m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
     ]
+}
+
+fn sample_piecewise_linear(samples: &[(f64, f64)], u: f64) -> f64 {
+    if samples.is_empty() {
+        return u.clamp(0.0, 1.0);
+    }
+    let u = u.clamp(0.0, 1.0);
+    if u <= samples[0].0 {
+        return samples[0].1;
+    }
+    let last = samples[samples.len() - 1];
+    if u >= last.0 {
+        return last.1;
+    }
+    for win in samples.windows(2) {
+        let (u0, y0) = win[0];
+        let (u1, y1) = win[1];
+        if u >= u0 && u <= u1 {
+            let du = u1 - u0;
+            if du <= 1e-9 {
+                return 0.5 * (y0 + y1);
+            }
+            let t = (u - u0) / du;
+            return (y0 + t * (y1 - y0)).clamp(0.0, 1.0);
+        }
+    }
+    u
 }
 
 /// Given a monotonically non-decreasing measured curve `(u_k, y_k)` with `u_k` in `[0, 1]`
@@ -409,6 +457,7 @@ pub fn compute_vcgt_tables(
                 midtone_50_vcgt: [0.5, 0.5, 0.5],
                 lut_curves: [ident_f.clone(), ident_f.clone(), ident_f],
                 used_measured_inversion: false,
+                used_rgb_subramps: false,
             },
         );
     }
@@ -440,6 +489,8 @@ pub fn compute_vcgt_tables(
     let lb = meas.black.y.clamp(0.0, lw * 0.2);
     let net_lw = (lw - lb).max(1e-6);
 
+    let has_rgb_subramps = meas.primary_ramps.iter().all(|r| r.len() >= 2);
+
     // Compute D65 channel gains and per-channel grayscale response curves
     let (d65_gains, channel_curves) = if let Some(m_inv) = invert_3x3(m_prim) {
         // Target CIE D65 white tristimulus (x=0.3127, y=0.3290) at net peak luminance
@@ -469,6 +520,25 @@ pub fn compute_vcgt_tables(
             gains[c] = (gains[c] / max_g).clamp(0.5, 1.0);
         }
 
+        // Build direct per-channel EOTF curves if separate R, G, B sub-ramps were measured
+        let peak_prim_y = [
+            (meas.red.y - lb).max(1e-6),
+            (meas.green.y - lb).max(1e-6),
+            (meas.blue.y - lb).max(1e-6),
+        ];
+        let mut direct_curves: [Vec<(f64, f64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        if has_rgb_subramps {
+            for c in 0..3 {
+                direct_curves[c].push((0.0, 0.0));
+                for &(u, ref r) in &meas.primary_ramps[c] {
+                    let norm_p = ((r.y - lb).max(0.0) / peak_prim_y[c]).clamp(0.0, 1.0);
+                    direct_curves[c].push((u.clamp(0.0, 1.0), norm_p));
+                }
+                direct_curves[c].push((1.0, 1.0));
+                direct_curves[c].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            }
+        }
+
         // Extract per-channel optical output across the measured grayscale ramp
         let mut curves: [Vec<(f64, f64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         for &(u, ref reading) in &meas.grayscale {
@@ -479,10 +549,18 @@ pub fn compute_vcgt_tables(
             ];
             let rgb_lin = mat_vec_mul(m_inv, dxyz);
             for c in 0..3 {
-                let norm_c = if native_w_rgb[c] > 1e-6 {
+                let gray_norm_c = if native_w_rgb[c] > 1e-6 {
                     (rgb_lin[c] / native_w_rgb[c]).clamp(0.0, 1.0)
                 } else {
                     ((reading.y - lb) / net_lw).clamp(0.0, 1.0)
+                };
+                // Blend direct R/G/B sub-ramp response (35%) with neutral gray-balance tracking (65%)
+                // when individual primary sub-ramps were captured.
+                let norm_c = if has_rgb_subramps {
+                    let direct_val = sample_piecewise_linear(&direct_curves[c], u);
+                    (0.65 * gray_norm_c + 0.35 * direct_val).clamp(0.0, 1.0)
+                } else {
+                    gray_norm_c
                 };
                 curves[c].push((u.clamp(0.0, 1.0), norm_c));
             }
@@ -564,8 +642,161 @@ pub fn compute_vcgt_tables(
             midtone_50_vcgt,
             lut_curves,
             used_measured_inversion: true,
+            used_rgb_subramps: has_rgb_subramps,
         },
     )
+}
+
+/// Convert CIE XYZ (normalized to reference white `(xn, yn, zn)`) to CIE 1976 `(L*, a*, b*)`.
+pub fn xyz_to_lab(x: f64, y: f64, z: f64, xn: f64, yn: f64, zn: f64) -> (f64, f64, f64) {
+    let f = |t: f64| -> f64 {
+        let delta: f64 = 6.0 / 29.0;
+        if t > delta.powi(3) {
+            t.cbrt()
+        } else {
+            t / (3.0 * delta.powi(2)) + 4.0 / 29.0
+        }
+    };
+    let fx = f((x / xn.max(1e-6)).max(0.0));
+    let fy = f((y / yn.max(1e-6)).max(0.0));
+    let fz = f((z / zn.max(1e-6)).max(0.0));
+    let l_star = (116.0 * fy - 16.0).max(0.0);
+    let a_star = 500.0 * (fx - fy);
+    let b_star = 200.0 * (fy - fz);
+    (l_star, a_star, b_star)
+}
+
+/// Compute CIE ΔE00 (CIEDE2000) perceptual color difference between two CIE Lab colors.
+pub fn ciede2000(lab1: (f64, f64, f64), lab2: (f64, f64, f64)) -> f64 {
+    let (l1, a1, b1) = lab1;
+    let (l2, a2, b2) = lab2;
+
+    let c1 = (a1 * a1 + b1 * b1).sqrt();
+    let c2 = (a2 * a2 + b2 * b2).sqrt();
+    let c_bar = 0.5 * (c1 + c2);
+    let c_bar7 = c_bar.powi(7);
+    let g = 0.5 * (1.0 - (c_bar7 / (c_bar7 + 25.0_f64.powi(7))).sqrt());
+
+    let a1_p = (1.0 + g) * a1;
+    let a2_p = (1.0 + g) * a2;
+    let c1_p = (a1_p * a1_p + b1 * b1).sqrt();
+    let c2_p = (a2_p * a2_p + b2 * b2).sqrt();
+
+    let h_deg = |ap: f64, b: f64| -> f64 {
+        if ap.abs() < 1e-9 && b.abs() < 1e-9 {
+            0.0
+        } else {
+            let deg = b.atan2(ap).to_degrees();
+            if deg < 0.0 {
+                deg + 360.0
+            } else {
+                deg
+            }
+        }
+    };
+    let h1_p = h_deg(a1_p, b1);
+    let h2_p = h_deg(a2_p, b2);
+
+    let dl_p = l2 - l1;
+    let dc_p = c2_p - c1_p;
+
+    let dh_deg = if c1_p * c2_p < 1e-9 {
+        0.0
+    } else {
+        let diff = h2_p - h1_p;
+        if diff.abs() <= 180.0 {
+            diff
+        } else if diff > 180.0 {
+            diff - 360.0
+        } else {
+            diff + 360.0
+        }
+    };
+    let dh_p = 2.0 * (c1_p * c2_p).sqrt() * (dh_deg.to_radians() * 0.5).sin();
+
+    let l_bar_p = 0.5 * (l1 + l2);
+    let c_bar_p = 0.5 * (c1_p + c2_p);
+    let h_bar_p = if c1_p * c2_p < 1e-9 {
+        h1_p + h2_p
+    } else if (h1_p - h2_p).abs() <= 180.0 {
+        0.5 * (h1_p + h2_p)
+    } else if h1_p + h2_p < 360.0 {
+        0.5 * (h1_p + h2_p + 360.0)
+    } else {
+        0.5 * (h1_p + h2_p - 360.0)
+    };
+
+    let t = 1.0
+        - 0.17 * (h_bar_p - 30.0).to_radians().cos()
+        + 0.24 * (2.0 * h_bar_p).to_radians().cos()
+        + 0.32 * (3.0 * h_bar_p + 6.0).to_radians().cos()
+        - 0.20 * (4.0 * h_bar_p - 63.0).to_radians().cos();
+
+    let d_theta = 30.0 * (-((h_bar_p - 275.0) / 25.0).powi(2)).exp();
+    let c_bar_p7 = c_bar_p.powi(7);
+    let r_c = 2.0 * (c_bar_p7 / (c_bar_p7 + 25.0_f64.powi(7))).sqrt();
+    let l_term = (l_bar_p - 50.0).powi(2);
+    let s_l = 1.0 + (0.015 * l_term) / (20.0 + l_term).sqrt();
+    let s_c = 1.0 + 0.045 * c_bar_p;
+    let s_h = 1.0 + 0.015 * c_bar_p * t;
+    let r_t = -r_c * (2.0 * d_theta).to_radians().sin();
+
+    let term_l = dl_p / s_l;
+    let term_c = dc_p / s_c;
+    let term_h = dh_p / s_h;
+
+    (term_l * term_l + term_c * term_c + term_h * term_h + r_t * term_c * term_h)
+        .max(0.0)
+        .sqrt()
+}
+
+/// Evaluate CIEDE2000 (`ΔE00`) of a measured verification patch against the target gamut + EOTF
+/// reference XYZ (and post-VCGT simulated XYZ).
+pub fn evaluate_verification_patch_de00(
+    patch: &VerificationPatchReading,
+    meas: &CalibrationMeasurements,
+    gamut: ColorGamut,
+    eotf: EotfConfig,
+) -> (f64, (f64, f64)) {
+    let lw = meas.white.y.max(1.0);
+    let lb = meas.black.y.clamp(0.0, lw * 0.2);
+    let net_lw = (lw - lb).max(1e-6);
+
+    // Target linear RGB stimulus under target EOTF
+    let mut lin_rgb = [0.0f64; 3];
+    for c in 0..3 {
+        let l_c = eotf_target_luminance(patch.stimulus_rgb[c], lw, lb, eotf);
+        lin_rgb[c] = ((l_c - lb) / net_lw).clamp(0.0, 1.0);
+    }
+
+    // Target gamut RGB -> CIE XYZ (normalized to Y=1 at D65 white)
+    let p = gamut.lcms_primaries();
+    let prim_xyz = |ciexyy: &CIExyY| -> (f64, f64, f64) {
+        let y_val = ciexyy.Y;
+        let y_ch = ciexyy.y.max(1e-6);
+        let x_val = (ciexyy.x / y_ch) * y_val;
+        let z_val = ((1.0 - ciexyy.x - ciexyy.y) / y_ch) * y_val;
+        (x_val, y_val, z_val)
+    };
+    let (rx, ry, rz) = prim_xyz(&p.Red);
+    let (gx, gy, gz) = prim_xyz(&p.Green);
+    let (bx, by, bz) = prim_xyz(&p.Blue);
+
+    let tgt_x = meas.black.x + net_lw * (rx * lin_rgb[0] + gx * lin_rgb[1] + bx * lin_rgb[2]);
+    let tgt_y = meas.black.y + net_lw * (ry * lin_rgb[0] + gy * lin_rgb[1] + by * lin_rgb[2]);
+    let tgt_z = meas.black.z + net_lw * (rz * lin_rgb[0] + gz * lin_rgb[1] + bz * lin_rgb[2]);
+
+    let sum_tgt = (tgt_x + tgt_y + tgt_z).max(1e-9);
+    let tgt_xy = (tgt_x / sum_tgt, tgt_y / sum_tgt);
+
+    let xn = lw * (0.3127 / 0.3290);
+    let yn = lw;
+    let zn = lw * ((1.0 - 0.3127 - 0.3290) / 0.3290);
+
+    let lab_tgt = xyz_to_lab(tgt_x, tgt_y, tgt_z, xn, yn, zn);
+    let lab_meas = xyz_to_lab(patch.reading.x, patch.reading.y, patch.reading.z, xn, yn, zn);
+
+    (ciede2000(lab_tgt, lab_meas), tgt_xy)
 }
 
 fn attach_metadata_and_vcgt(
