@@ -13,8 +13,12 @@ rm -f "${HOME}/.local/share/applications/${APP_ID}.desktop"
 rm -f "${HOME}/.local/share/applications/yutani.desktop"
 rm -f "${HOME}/.local/share/icons/hicolor/scalable/apps/yutani.svg"
 rm -f "${HOME}/.local/share/icons/hicolor/scalable/apps/${APP_ID}.svg"
-rm -f "${HOME}/.local/share/icons/hicolor/256x256/apps/yutani.png"
-rm -f "${HOME}/.local/share/icons/hicolor/256x256/apps/${APP_ID}.png"
+for sz in 256 128 64 48; do
+    rm -f "${HOME}/.local/share/icons/hicolor/${sz}x${sz}/apps/yutani.png"
+    rm -f "${HOME}/.local/share/icons/hicolor/${sz}x${sz}/apps/${APP_ID}.png"
+done
+rm -f "${HOME}/.local/share/pixmaps/yutani.png"
+rm -f "${HOME}/.local/share/pixmaps/${APP_ID}.png"
 rm -f "${HOME}/Desktop/${APP_ID}.desktop"
 
 if [[ -f "/usr/local/bin/yutani" ]] || [[ -f "/etc/udev/rules.d/60-yutani-spyder.rules" ]]; then
@@ -24,8 +28,12 @@ if [[ -f "/usr/local/bin/yutani" ]] || [[ -f "/etc/udev/rules.d/60-yutani-spyder
     sudo rm -f "/usr/share/applications/yutani.desktop"
     sudo rm -f "/usr/share/icons/hicolor/scalable/apps/yutani.svg"
     sudo rm -f "/usr/share/icons/hicolor/scalable/apps/${APP_ID}.svg"
-    sudo rm -f "/usr/share/icons/hicolor/256x256/apps/yutani.png"
-    sudo rm -f "/usr/share/icons/hicolor/256x256/apps/${APP_ID}.png"
+    for sz in 256 128 64 48; do
+        sudo rm -f "/usr/share/icons/hicolor/${sz}x${sz}/apps/yutani.png"
+        sudo rm -f "/usr/share/icons/hicolor/${sz}x${sz}/apps/${APP_ID}.png"
+    done
+    sudo rm -f "/usr/share/pixmaps/yutani.png"
+    sudo rm -f "/usr/share/pixmaps/${APP_ID}.png"
     sudo rm -f "/etc/udev/rules.d/60-yutani-spyder.rules"
     if command -v udevadm >/dev/null 2>&1; then
         sudo udevadm control --reload-rules || true

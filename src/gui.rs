@@ -43,60 +43,321 @@ pub fn run_gui() -> eframe::Result<()> {
 /// Generate a crisp 64x64 RGBA window icon matching `assets/yutani.svg` (CRT amber chassis,
 /// CIE gamut triangle, and Spyder optical aperture crosshair).
 fn build_yutani_window_icon() -> egui::IconData {
-    let w = 64usize;
-    let h = 64usize;
-    let mut rgba = vec![0u8; w * h * 4];
-    let cx = 31.5_f32;
-    let cy = 33.0_f32;
+    let size = 64usize;
+    let rgba = render_yutani_icon_rgba(size);
+    egui::IconData {
+        rgba,
+        width: size as u32,
+        height: size as u32,
+    }
+}
 
-    for y in 0..h {
-        for x in 0..w {
-            let idx = (y * w + x) * 4;
-            let fx = x as f32;
-            let fy = y as f32;
+/// Point-to-segment distance helper in normalized 256x256 icon space.
+fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let vx = bx - ax;
+    let vy = by - ay;
+    let wx = px - ax;
+    let wy = py - ay;
+    let c1 = wx * vx + wy * vy;
+    if c1 <= 0.0 {
+        return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
+    }
+    let c2 = vx * vx + vy * vy;
+    if c2 <= c1 {
+        return ((px - bx).powi(2) + (py - by).powi(2)).sqrt();
+    }
+    let b = c1 / c2;
+    let pbx = ax + b * vx;
+    let pby = ay + b * vy;
+    ((px - pbx).powi(2) + (py - pby).powi(2)).sqrt()
+}
 
-            // Rounded outer CRT bezel (60x60 inside 64x64)
-            if x < 2 || x >= 62 || y < 2 || y >= 62 {
+/// Render the Yutani application icon at any square resolution (`size x size`) as RGBA8888 bytes.
+/// Includes rounded CRT chassis bezel, corner telemetry brackets, CIE 1931 gamut triangle with
+/// R/G/B primary vertex nodes, Spyder optical aperture ring, and D65 whitepoint crosshair.
+pub fn render_yutani_icon_rgba(size: usize) -> Vec<u8> {
+    let s = size.max(16);
+    let mut rgba = vec![0u8; s * s * 4];
+    let scale = 256.0_f32 / (s as f32);
+
+    // Triangle vertices in 256x256 space: Green (top), Red (right), Blue (bottom-left)
+    let gx = 96.0_f32;
+    let gy = 48.0_f32;
+    let rx = 204.0_f32;
+    let ry = 166.0_f32;
+    let bx = 58.0_f32;
+    let by = 196.0_f32;
+
+    for y in 0..s {
+        for x in 0..s {
+            let idx = (y * s + x) * 4;
+            let ux = (x as f32 + 0.5) * scale;
+            let uy = (y as f32 + 0.5) * scale;
+
+            // Signed distance to rounded box centered at (128, 128), half-size 116, corner radius 26
+            let qx = (ux - 128.0).abs() - (120.0 - 26.0);
+            let qy = (uy - 128.0).abs() - (120.0 - 26.0);
+            let sdf_box =
+                (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - 26.0;
+
+            if sdf_box > 1.0 {
+                // Transparent outside the rounded CRT frame
                 continue;
             }
-            let border = x <= 3 || x >= 60 || y <= 3 || y >= 60;
-            let dx = fx - cx;
-            let dy = fy - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
 
-            let (r, g, b, a) = if border {
-                (255, 180, 40, 255)
-            } else if (dist - 14.5).abs() <= 1.2 {
-                // Outer amber sensor reticle ring
-                (255, 180, 40, 255)
-            } else if (dist - 7.5).abs() <= 1.0 {
-                // Inner cyan optical aperture ring
-                (90, 235, 190, 255)
-            } else if dist <= 2.2 {
-                // D65 whitepoint center dot
-                (255, 244, 208, 255)
-            } else if (dx.abs() <= 0.8 && dy.abs() <= 11.0)
-                || (dy.abs() <= 0.8 && dx.abs() <= 11.0)
-            {
-                // Reticle crosshair
-                (255, 180, 40, 255)
+            // Base dark CRT phosphor radial gradient
+            let cdx = ux - 128.0;
+            let cdy = uy - 132.0;
+            let cdist = (cdx * cdx + cdy * cdy).sqrt();
+            let vignette = (1.0 - (cdist / 160.0)).clamp(0.0, 1.0);
+            let mut r_col = 8.0 + 18.0 * vignette;
+            let mut g_col = 8.0 + 12.0 * vignette;
+            let mut b_col = 6.0 + 4.0 * vignette;
+
+            // Subtle CRT scanline texture
+            if ((uy as i32) / 4) % 2 == 0 {
+                r_col *= 0.90;
+                g_col *= 0.90;
+                b_col *= 0.90;
+            }
+
+            // Barycentric coordinates for CIE gamut triangle fill
+            let denom = (ry - by) * (gx - bx) + (bx - rx) * (gy - by);
+            let w1 = ((ry - by) * (ux - bx) + (bx - rx) * (uy - by)) / denom;
+            let w2 = ((by - gy) * (ux - bx) + (gx - bx) * (uy - by)) / denom;
+            let w3 = 1.0 - w1 - w2;
+            if w1 >= 0.0 && w2 >= 0.0 && w3 >= 0.0 {
+                // Blend subtle RGB gamut glow inside the triangle
+                let tri_r = w1 * 65.0 + w2 * 245.0 + w3 * 70.0;
+                let tri_g = w1 * 230.0 + w2 * 75.0 + w3 * 145.0;
+                let tri_b = w1 * 95.0 + w2 * 64.0 + w3 * 255.0;
+                r_col = r_col * 0.72 + tri_r * 0.28;
+                g_col = g_col * 0.72 + tri_g * 0.28;
+                b_col = b_col * 0.72 + tri_b * 0.28;
+            }
+
+            // Inner dark bezel ring
+            if (sdf_box + 14.0).abs() <= 1.6 {
+                r_col = 90.0;
+                g_col = 60.0;
+                b_col = 14.0;
+            }
+
+            // Outer amber CRT bezel border
+            if sdf_box >= -5.5 {
+                r_col = 255.0;
+                g_col = 180.0;
+                b_col = 40.0;
+            }
+
+            // Corner telemetry brackets
+            let in_corner_x = (ux >= 30.0 && ux <= 58.0 && (uy - 32.0).abs() <= 2.2)
+                || (ux >= 198.0 && ux <= 226.0 && (uy - 32.0).abs() <= 2.2)
+                || (ux >= 30.0 && ux <= 58.0 && (uy - 224.0).abs() <= 2.2)
+                || (ux >= 198.0 && ux <= 226.0 && (uy - 224.0).abs() <= 2.2);
+            let in_corner_y = (uy >= 30.0 && uy <= 58.0 && (ux - 32.0).abs() <= 2.2)
+                || (uy >= 30.0 && uy <= 58.0 && (ux - 224.0).abs() <= 2.2)
+                || (uy >= 198.0 && uy <= 226.0 && (ux - 32.0).abs() <= 2.2)
+                || (uy >= 198.0 && uy <= 226.0 && (ux - 224.0).abs() <= 2.2);
+            if in_corner_x || in_corner_y {
+                r_col = 255.0;
+                g_col = 185.0;
+                b_col = 50.0;
+            }
+
+            // CIE Gamut triangle edges
+            let d_gr = dist_to_segment(ux, uy, gx, gy, rx, ry);
+            let d_rb = dist_to_segment(ux, uy, rx, ry, bx, by);
+            let d_bg = dist_to_segment(ux, uy, bx, by, gx, gy);
+            let d_tri = d_gr.min(d_rb).min(d_bg);
+            if d_tri <= 2.2 {
+                r_col = 255.0;
+                g_col = 180.0;
+                b_col = 40.0;
+            }
+
+            // Spyder Optical Aperture Reticle Ring (center 128, 134)
+            let rdx = ux - 128.0;
+            let rdy = uy - 134.0;
+            let rdist = (rdx * rdx + rdy * rdy).sqrt();
+
+            // Darken interior of inner optical lens
+            if rdist < 26.0 {
+                r_col *= 0.45;
+                g_col *= 0.45;
+                b_col *= 0.45;
+            }
+
+            // Outer dashed amber reticle ring (r = 46)
+            if (rdist - 46.0).abs() <= 2.4 {
+                let angle = rdy.atan2(rdx);
+                let sector = ((angle + std::f32::consts::PI) / (std::f32::consts::PI / 6.0)) as i32;
+                if sector % 2 == 0 {
+                    r_col = 255.0;
+                    g_col = 190.0;
+                    b_col = 55.0;
+                }
+            }
+
+            // Inner cyan optical aperture ring (r = 25)
+            if (rdist - 25.0).abs() <= 2.2 {
+                r_col = 90.0;
+                g_col = 235.0;
+                b_col = 184.0;
+            }
+
+            // D65 Whitepoint Crosshair
+            if (rdx.abs() <= 1.6 && rdy.abs() <= 36.0) || (rdy.abs() <= 1.6 && rdx.abs() <= 36.0) {
+                r_col = 255.0;
+                g_col = 185.0;
+                b_col = 45.0;
+            }
+
+            // D65 Whitepoint center target dot
+            if rdist <= 6.0 {
+                r_col = 255.0;
+                g_col = 244.0;
+                b_col = 208.0;
+            }
+
+            // Primary vertex nodes (Green, Red, Blue)
+            let dg = ((ux - gx).powi(2) + (uy - gy).powi(2)).sqrt();
+            let dr = ((ux - rx).powi(2) + (uy - ry).powi(2)).sqrt();
+            let db = ((ux - bx).powi(2) + (uy - by).powi(2)).sqrt();
+            if dg <= 8.5 {
+                if dg >= 6.5 {
+                    r_col = 10.0;
+                    g_col = 10.0;
+                    b_col = 8.0;
+                } else {
+                    r_col = 75.0;
+                    g_col = 230.0;
+                    b_col = 96.0;
+                }
+            } else if dr <= 8.5 {
+                if dr >= 6.5 {
+                    r_col = 10.0;
+                    g_col = 10.0;
+                    b_col = 8.0;
+                } else {
+                    r_col = 245.0;
+                    g_col = 75.0;
+                    b_col = 64.0;
+                }
+            } else if db <= 8.5 {
+                if db >= 6.5 {
+                    r_col = 10.0;
+                    g_col = 10.0;
+                    b_col = 8.0;
+                } else {
+                    r_col = 85.0;
+                    g_col = 155.0;
+                    b_col = 255.0;
+                }
+            }
+
+            let alpha = if sdf_box > 0.0 {
+                ((1.0 - sdf_box) * 255.0).clamp(0.0, 255.0) as u8
             } else {
-                // Dark CRT phosphor background
-                (12, 10, 8, 255)
+                255u8
             };
 
-            rgba[idx] = r;
-            rgba[idx + 1] = g;
-            rgba[idx + 2] = b;
-            rgba[idx + 3] = a;
+            rgba[idx] = r_col.clamp(0.0, 255.0) as u8;
+            rgba[idx + 1] = g_col.clamp(0.0, 255.0) as u8;
+            rgba[idx + 2] = b_col.clamp(0.0, 255.0) as u8;
+            rgba[idx + 3] = alpha;
         }
     }
 
-    egui::IconData {
-        rgba,
-        width: w as u32,
-        height: h as u32,
+    rgba
+}
+
+fn png_crc32(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in chunk_type.iter().chain(data.iter()) {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
     }
+    !crc
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(data);
+    let crc = png_crc32(chunk_type, data);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Export the Yutani RGBA icon directly to a standalone valid PNG file on disk without requiring
+/// external tools (`rsvg-convert` or `ImageMagick`).
+pub fn export_yutani_png_icon(path: &std::path::Path, size: u32) -> anyhow::Result<()> {
+    let s = size.clamp(16, 512) as usize;
+    let rgba = render_yutani_icon_rgba(s);
+
+    // Build raw scanlines (each row prefixed with filter byte 0 = None)
+    let row_bytes = s * 4;
+    let mut raw_scanlines = Vec::with_capacity((row_bytes + 1) * s);
+    for y in 0..s {
+        raw_scanlines.push(0u8);
+        let start = y * row_bytes;
+        raw_scanlines.extend_from_slice(&rgba[start..start + row_bytes]);
+    }
+
+    // Wrap raw scanlines in valid zlib stream using uncompressed DEFLATE blocks (RFC 1950 / 1951)
+    let mut zlib_data = Vec::with_capacity(raw_scanlines.len() + 64);
+    zlib_data.push(0x78); // CMF: deflate, 32K window
+    zlib_data.push(0x01); // FLG: no preset dict, FCHECK valid (0x7801 % 31 == 0)
+
+    let chunks: Vec<&[u8]> = raw_scanlines.chunks(65535).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i + 1 == chunks.len();
+        zlib_data.push(if is_last { 0x01 } else { 0x00 });
+        let len = chunk.len() as u16;
+        let nlen = !len;
+        zlib_data.extend_from_slice(&len.to_le_bytes());
+        zlib_data.extend_from_slice(&nlen.to_le_bytes());
+        zlib_data.extend_from_slice(chunk);
+    }
+
+    // Compute Adler-32 checksum over uncompressed scanlines
+    let mut s1 = 1u32;
+    let mut s2 = 0u32;
+    for &b in &raw_scanlines {
+        s1 = (s1 + (b as u32)) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    let adler = (s2 << 16) | s1;
+    zlib_data.extend_from_slice(&adler.to_be_bytes());
+
+    let mut png = Vec::with_capacity(zlib_data.len() + 128);
+    // PNG magic signature
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+
+    // IHDR chunk (width, height, bit_depth=8, color_type=6 RGBA, compression=0, filter=0, interlace=0)
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(s as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(s as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    write_png_chunk(&mut png, b"IHDR", &ihdr);
+
+    // IDAT chunk
+    write_png_chunk(&mut png, b"IDAT", &zlib_data);
+
+    // IEND chunk
+    write_png_chunk(&mut png, b"IEND", &[]);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, png)?;
+    Ok(())
 }
 
 fn configure_yutani_theme(ctx: &egui::Context) {
@@ -1552,7 +1813,7 @@ impl YutaniApp {
             eotf: EotfConfig::default(),
             patch_preset: PatchPreset::default(),
             oled_windowed_apl: default_display.is_oled(),
-            apply_panel_ccmx: true,
+            apply_panel_ccmx: false,
             dark_patch_averaging: true,
             ten_bit_frc_dither: true,
             frame_counter: 0,

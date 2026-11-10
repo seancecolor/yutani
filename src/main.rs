@@ -42,6 +42,15 @@ enum Command {
         #[arg(long)]
         no_ccmx: bool,
     },
+    /// Export the Yutani application icon as a standalone PNG file
+    ExportIcon {
+        /// Destination PNG path
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+        /// Square icon dimension in pixels (e.g. 256, 128, 64, 48)
+        #[arg(short, long, default_value_t = 256)]
+        size: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -125,6 +134,15 @@ fn main() -> Result<()> {
                         );
                     }
                 }
+            }
+            Command::ExportIcon { output, size } => {
+                gui::export_yutani_png_icon(&output, size)?;
+                println!(
+                    "Exported {}x{} Yutani PNG icon to {}",
+                    size,
+                    size,
+                    output.display()
+                );
             }
         }
     } else {

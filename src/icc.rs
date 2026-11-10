@@ -88,25 +88,26 @@ impl DisplayTarget {
 
     /// 3x3 Colorimeter Correction Matrix (CCMX) compensating for SpyderX2 / SpyderPro
     /// filter metameric shift on narrow-band QD-OLED, W-LED IPS, and RGB OLED emission spectra.
+    /// Row-normalized to preserve CIE D65 whitepoint (`[0.95047, 1.00000, 1.08883]`) without tinting.
     pub fn ccmx_matrix(self) -> [[f64; 3]; 3] {
         match self {
-            // QD-OLED (narrow-band blue electroluminescence + red/green quantum dots)
+            // QD-OLED (D65-neutral spectral compensation)
             Self::Pa32Ucdm => [
-                [1.0142, -0.0118, -0.0021],
-                [0.0038, 0.9964, -0.0002],
-                [-0.0014, -0.0046, 1.0062],
+                [1.0032, -0.0020, -0.0010],
+                [0.0012, 0.9990, -0.0001],
+                [-0.0006, -0.0018, 1.0022],
             ],
-            // Wide-gamut PFS/KSF phosphor W-LED IPS
+            // Wide-gamut PFS/KSF phosphor W-LED IPS (D65-neutral)
             Self::Pa279Crv => [
-                [1.0065, -0.0052, -0.0011],
-                [0.0019, 0.9983, -0.0002],
-                [-0.0008, -0.0021, 1.0029],
+                [1.0020, -0.0013, -0.0006],
+                [0.0008, 0.9993, -0.0001],
+                [-0.0004, -0.0010, 1.0013],
             ],
-            // RGB OLED
+            // RGB OLED (D65-neutral)
             Self::Mq16Ahe => [
-                [1.0094, -0.0079, -0.0014],
-                [0.0025, 0.9977, -0.0002],
-                [-0.0011, -0.0032, 1.0043],
+                [1.0026, -0.0016, -0.0008],
+                [0.0010, 0.9991, -0.0001],
+                [-0.0005, -0.0014, 1.0017],
             ],
         }
     }
@@ -664,21 +665,30 @@ pub fn compute_vcgt_tables(
         }
         let max_g = gains[0].max(gains[1]).max(gains[2]).max(1e-6);
         for c in 0..3 {
-            gains[c] = (gains[c] / max_g).clamp(0.5, 1.0);
+            let norm_g = gains[c] / max_g;
+            // Apply damped whitepoint trim and clamp to [0.85, 1.0] so the 1D VCGT LUT
+            // refines D65 gray balance without introducing an aggressive primary cast.
+            gains[c] = (0.35 + 0.65 * norm_g).clamp(0.85, 1.0);
         }
 
-        // Build direct per-channel EOTF curves if separate R, G, B sub-ramps were measured
-        let peak_prim_y = [
-            (meas.red.y - lb).max(1e-6),
-            (meas.green.y - lb).max(1e-6),
-            (meas.blue.y - lb).max(1e-6),
+        // Build direct per-channel EOTF curves if separate R, G, B sub-ramps were measured,
+        // using each primary's highest-SNR tristimulus channel (X for Red, Y for Green, Z for Blue).
+        let peak_prim_dom = [
+            (meas.red.x - bx).max(1e-6),
+            (meas.green.y - by).max(1e-6),
+            (meas.blue.z - bz).max(1e-6),
         ];
         let mut direct_curves: [Vec<(f64, f64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         if has_rgb_subramps {
             for c in 0..3 {
                 direct_curves[c].push((0.0, 0.0));
                 for &(u, ref r) in &meas.primary_ramps[c] {
-                    let norm_p = ((r.y - lb).max(0.0) / peak_prim_y[c]).clamp(0.0, 1.0);
+                    let dom_val = match c {
+                        0 => (r.x - bx).max(0.0),
+                        1 => (r.y - by).max(0.0),
+                        _ => (r.z - bz).max(0.0),
+                    };
+                    let norm_p = (dom_val / peak_prim_dom[c]).clamp(0.0, 1.0);
                     direct_curves[c].push((u.clamp(0.0, 1.0), norm_p));
                 }
                 direct_curves[c].push((1.0, 1.0));
@@ -694,18 +704,20 @@ pub fn compute_vcgt_tables(
                 (reading.y - by).max(0.0),
                 (reading.z - bz).max(0.0),
             ];
+            let lum_norm = ((reading.y - lb) / net_lw).clamp(0.0, 1.0);
             let rgb_lin = mat_vec_mul(m_inv, dxyz);
             for c in 0..3 {
-                let gray_norm_c = if native_w_rgb[c] > 1e-6 {
+                let raw_gray_c = if native_w_rgb[c] > 1e-6 {
                     (rgb_lin[c] / native_w_rgb[c]).clamp(0.0, 1.0)
                 } else {
-                    ((reading.y - lb) / net_lw).clamp(0.0, 1.0)
+                    lum_norm
                 };
-                // Blend direct R/G/B sub-ramp response (35%) with neutral gray-balance tracking (65%)
-                // when individual primary sub-ramps were captured.
+                // Anchor per-channel grayscale tracking to overall luminance (50%) +
+                // channel gray balance (50%) to prevent sensor noise from tinting midtones.
+                let gray_norm_c = (0.50 * lum_norm + 0.50 * raw_gray_c).clamp(0.0, 1.0);
                 let norm_c = if has_rgb_subramps {
                     let direct_val = sample_pchip(&direct_curves[c], u);
-                    (0.65 * gray_norm_c + 0.35 * direct_val).clamp(0.0, 1.0)
+                    (0.75 * gray_norm_c + 0.25 * direct_val).clamp(0.0, 1.0)
                 } else {
                     gray_norm_c
                 };
@@ -1110,7 +1122,10 @@ pub fn generate_profile_from_measurements(
         }
     };
 
-    let primaries = if valid_optical {
+    // Use standard reference primaries when Rec.709 or Display P3 is targeted so KWin's
+    // 3x3 gamut shader maps accurately without colorimeter metameric cross-tinting;
+    // use validated measured primaries when Native Wide Gamut is explicitly selected.
+    let primaries = if valid_optical && matches!(gamut, ColorGamut::Native) {
         let (rx, ry, r_lum) = meas.red.to_xyy();
         let (gx, gy, g_lum) = meas.green.to_xyy();
         let (bx, by, b_lum) = meas.blue.to_xyy();
@@ -1121,18 +1136,18 @@ pub fn generate_profile_from_measurements(
         let lum_sum = (r_eff + g_eff + b_eff).max(1e-6);
         CIExyYTRIPLE {
             Red: CIExyY {
-                x: rx.clamp(0.50, 0.75),
-                y: ry.clamp(0.20, 0.45),
+                x: rx.clamp(0.60, 0.72),
+                y: ry.clamp(0.28, 0.36),
                 Y: r_eff / lum_sum,
             },
             Green: CIExyY {
-                x: gx.clamp(0.15, 0.45),
-                y: gy.clamp(0.50, 0.80),
+                x: gx.clamp(0.20, 0.35),
+                y: gy.clamp(0.58, 0.74),
                 Y: g_eff / lum_sum,
             },
             Blue: CIExyY {
-                x: bx.clamp(0.10, 0.25),
-                y: by.clamp(0.02, 0.20),
+                x: bx.clamp(0.13, 0.17),
+                y: by.clamp(0.04, 0.09),
                 Y: b_eff / lum_sum,
             },
         }

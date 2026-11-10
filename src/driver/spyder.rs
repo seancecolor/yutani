@@ -638,14 +638,16 @@ fn parse_calibration(
             }
             let v1 = cal[6];
             let v2 = u16::from_be_bytes([cal[7], cal[8]]);
-            // 9 IEEE754 LE floats starting at byte 15 (after 5B header + 1B idx + 1B v1 + 2B v2 + 6B chan map)
+            // 9 IEEE754 LE floats starting at byte 15 (after 5B header + 1B idx + 1B v1 + 2B v2 + 6B chan map).
+            // Stored in column-major order: 3 columns of [X, Y, Z] per sensor channel c = 0, 1, 2
+            // (so f[6] is the short-wave blue lobe contribution of channel 2 to CIE X).
             let mut matrix = [[0.0f64; 3]; 3];
             let mut secondary_matrix = [[0.0f64; 3]; 3];
             for r in 0..3 {
                 for c in 0..3 {
-                    let idx = 15 + (r * 3 + c) * 4;
+                    let idx = 15 + (c * 3 + r) * 4;
                     matrix[r][c] = read_f32_le(cal, idx);
-                    let sec_idx = 51 + (r * 3 + c) * 4;
+                    let sec_idx = 51 + (c * 3 + r) * 4;
                     secondary_matrix[r][c] = read_f32_le(cal, sec_idx);
                 }
             }
@@ -667,7 +669,7 @@ fn parse_calibration(
             let mut matrix = [[0.0f64; 3]; 3];
             for r in 0..3 {
                 for c in 0..3 {
-                    let idx = 9 + (r * 3 + c) * 4;
+                    let idx = 9 + (c * 3 + r) * 4;
                     matrix[r][c] = read_f32_le(cal, idx);
                 }
             }

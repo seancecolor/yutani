@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# YUTANI WAYLAND DISPLAY PROFILER v0.1.5 — NOBARA / FEDORA LINUX INSTALLER
+# YUTANI WAYLAND DISPLAY PROFILER v0.1.6 — NOBARA / FEDORA LINUX INSTALLER
 # ==============================================================================
 # Builds and installs the Yutani binary, scalable CRT Amber icon, KDE Plasma /
 # Wayland .desktop launcher, Desktop shortcut, and Datacolor Spyder USB udev rules.
@@ -23,7 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ID="yutani.calibration"
 BIN_NAME="yutani"
-VERSION="$(awk -F'"' '/^version *=/ { print $2; exit }' "${SCRIPT_DIR}/Cargo.toml" 2>/dev/null || echo "0.1.5")"
+VERSION="$(awk -F'"' '/^version *=/ { print $2; exit }' "${SCRIPT_DIR}/Cargo.toml" 2>/dev/null || echo "0.1.6")"
 
 UPDATE_MODE=0
 SYSTEM_INSTALL=0
@@ -150,11 +150,13 @@ if [[ "$SYSTEM_INSTALL" -eq 1 ]]; then
     BIN_DIR="/usr/local/bin"
     APP_DIR="/usr/share/applications"
     ICON_BASE="/usr/share/icons/hicolor"
+    PIXMAPS_DIR="/usr/share/pixmaps"
     SUDO_CMD="sudo"
 else
     BIN_DIR="${HOME}/.local/bin"
     APP_DIR="${HOME}/.local/share/applications"
     ICON_BASE="${HOME}/.local/share/icons/hicolor"
+    PIXMAPS_DIR="${HOME}/.local/share/pixmaps"
     SUDO_CMD=""
 fi
 
@@ -163,36 +165,52 @@ SCALABLE_ICON_DIR="${ICON_BASE}/scalable/apps"
 PNG256_ICON_DIR="${ICON_BASE}/256x256/apps"
 
 echo "${amber}> Installing binary to ${TARGET_BIN}...${reset}"
-$SUDO_CMD mkdir -p "$BIN_DIR" "$APP_DIR" "$SCALABLE_ICON_DIR"
+$SUDO_CMD mkdir -p "$BIN_DIR" "$APP_DIR" "$SCALABLE_ICON_DIR" "$PIXMAPS_DIR"
 $SUDO_CMD install -m 0755 "$RELEASE_BIN" "$TARGET_BIN"
 
-echo "${amber}> Installing scalable vector icon to ${SCALABLE_ICON_DIR}...${reset}"
+echo "${amber}> Installing scalable vector & multi-resolution PNG icons to ${ICON_BASE}...${reset}"
 $SUDO_CMD install -m 0644 "${SCRIPT_DIR}/assets/yutani.svg" "${SCALABLE_ICON_DIR}/yutani.svg"
 $SUDO_CMD install -m 0644 "${SCRIPT_DIR}/assets/yutani.svg" "${SCALABLE_ICON_DIR}/${APP_ID}.svg"
 
-# Optional raster 256x256 PNG generation if rsvg-convert is available on Nobara
-if command -v rsvg-convert >/dev/null 2>&1; then
-    $SUDO_CMD mkdir -p "$PNG256_ICON_DIR"
-    rsvg-convert -w 256 -h 256 "${SCRIPT_DIR}/assets/yutani.svg" -o "/tmp/yutani-256.png"
-    $SUDO_CMD install -m 0644 "/tmp/yutani-256.png" "${PNG256_ICON_DIR}/yutani.png"
-    $SUDO_CMD install -m 0644 "/tmp/yutani-256.png" "${PNG256_ICON_DIR}/${APP_ID}.png"
-    rm -f "/tmp/yutani-256.png"
+# Ensure user-local hicolor index.theme exists so KDE KIconLoader indexes user icons cleanly
+if [[ "$SYSTEM_INSTALL" -eq 0 ]] && [[ ! -f "${ICON_BASE}/index.theme" ]] && [[ -f "/usr/share/icons/hicolor/index.theme" ]]; then
+    cp "/usr/share/icons/hicolor/index.theme" "${ICON_BASE}/index.theme" || true
 fi
 
-# Generate .desktop entry pointing directly to the installed binary path so KDE
-# Application Launcher and Desktop icon work even if ~/.local/bin is not in PATH.
+# Generate crisp raster PNG icons directly via the built-in Yutani icon exporter
+# (no external rsvg-convert or ImageMagick dependency required)
+for sz in 256 128 64 48; do
+    ICON_SZ_DIR="${ICON_BASE}/${sz}x${sz}/apps"
+    TMP_PNG="/tmp/yutani-${sz}.png"
+    $SUDO_CMD mkdir -p "$ICON_SZ_DIR"
+    "$TARGET_BIN" export-icon --output "$TMP_PNG" --size "$sz" >/dev/null
+    $SUDO_CMD install -m 0644 "$TMP_PNG" "${ICON_SZ_DIR}/yutani.png"
+    $SUDO_CMD install -m 0644 "$TMP_PNG" "${ICON_SZ_DIR}/${APP_ID}.png"
+    if [[ "$sz" -eq 256 ]]; then
+        $SUDO_CMD install -m 0644 "$TMP_PNG" "${PIXMAPS_DIR}/yutani.png"
+        $SUDO_CMD install -m 0644 "$TMP_PNG" "${PIXMAPS_DIR}/${APP_ID}.png"
+    fi
+    rm -f "$TMP_PNG"
+done
+
+# Generate .desktop entry pointing directly to the installed binary path and
+# absolute 256x256 PNG icon path so KDE Plasma Application Launcher, KRunner,
+# and Desktop shortcut render the icon immediately even without icon theme cache.
 TMP_DESKTOP="$(mktemp)"
 sed \
     -e "s|^Exec=yutani$|Exec=${TARGET_BIN}|" \
     -e "s|^TryExec=yutani$|TryExec=${TARGET_BIN}|" \
+    -e "s|^Icon=yutani$|Icon=${PNG256_ICON_DIR}/yutani.png|" \
     -e "s|__YUTANI_REPO_DIR__|${SCRIPT_DIR}|g" \
     -e "s|yutani detect|${TARGET_BIN} detect|g" \
     -e "s|yutani probe|${TARGET_BIN} probe|g" \
     "${SCRIPT_DIR}/assets/${APP_ID}.desktop" > "$TMP_DESKTOP"
 
 echo "${amber}> Installing FreeDesktop launcher to ${APP_DIR}/${APP_ID}.desktop...${reset}"
+# Remove any legacy duplicate yutani.desktop launcher so only one entry appears in KDE menu
+$SUDO_CMD rm -f "${APP_DIR}/yutani.desktop"
+rm -f "${HOME}/.local/share/applications/yutani.desktop"
 $SUDO_CMD install -m 0644 "$TMP_DESKTOP" "${APP_DIR}/${APP_ID}.desktop"
-$SUDO_CMD install -m 0644 "$TMP_DESKTOP" "${APP_DIR}/yutani.desktop"
 
 # Also place a clickable launcher icon on ~/Desktop if requested and directory exists
 if [[ "$DESKTOP_SHORTCUT" -eq 1 ]] && [[ -d "${HOME}/Desktop" ]]; then
@@ -224,6 +242,7 @@ fi
 # ------------------------------------------------------------------------------
 # 5. Refresh KDE Plasma 6 / FreeDesktop Icon & Application Caches
 # ------------------------------------------------------------------------------
+rm -f "${HOME}/.cache/icon-cache.kcache" || true
 if command -v update-desktop-database >/dev/null 2>&1; then
     $SUDO_CMD update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
 fi
@@ -242,7 +261,7 @@ echo "${cyan}  YUTANI v${VERSION} INSTALLATION COMPLETE                         
 echo "${cyan}========================================================================${reset}"
 echo "  Binary   : ${TARGET_BIN}"
 echo "  Launcher : ${APP_DIR}/${APP_ID}.desktop"
-echo "  Icon     : ${SCALABLE_ICON_DIR}/yutani.svg"
+echo "  Icon     : ${PNG256_ICON_DIR}/yutani.png"
 if [[ "$DESKTOP_SHORTCUT" -eq 1 ]] && [[ -d "${HOME}/Desktop" ]]; then
     echo "  Desktop  : ${HOME}/Desktop/${APP_ID}.desktop"
 fi
