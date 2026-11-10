@@ -5,9 +5,10 @@ use eframe::egui;
 
 use crate::driver::spyder::{SpyderSession, XyzReading};
 use crate::icc::{
-    bt1886_params, eotf_target_luminance, evaluate_verification_patch_de00,
-    generate_profile_from_measurements, CalibrationMeasurements, ColorGamut, DisplayTarget,
-    EotfConfig, VcgtSummary, VerificationPatchReading,
+    bt1886_params, ciede2000, eotf_target_luminance, evaluate_grayscale_de00,
+    evaluate_verification_patch_de00, generate_profile_from_measurements, xyz_to_lab,
+    CalibrationMeasurements, ColorGamut, DisplayTarget, EotfConfig, VcgtSummary,
+    VerificationPatchReading,
 };
 
 /// Duration of the Yutani CRT terminal startup sequence.
@@ -303,7 +304,7 @@ fn build_calibration_patches(preset: PatchPreset) -> Vec<PatchSpec> {
 const OSD_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 /// Compute D65-normalized linear RGB balance `(r_pct, g_pct, b_pct)`, Correlated Color
-/// Temperature `cct_kelvin`, and CIE 1976 `delta_e_ab` relative to CIE D65 whitepoint.
+/// Temperature `cct_kelvin`, and CIEDE2000 `delta_e00` relative to CIE D65 whitepoint.
 fn compute_d65_alignment_metrics(reading: &XyzReading) -> ([f64; 3], f64, f64) {
     let (cx, cy, lum) = reading.to_xyy();
     if lum <= 1e-4 {
@@ -330,25 +331,13 @@ fn compute_d65_alignment_metrics(reading: &XyzReading) -> ([f64; 3], f64, f64) {
     let n = (cx - 0.3320) / denom;
     let cct = (449.0 * n.powi(3) + 3525.0 * n.powi(2) + 6823.3 * n + 5520.33).clamp(1500.0, 25000.0);
 
-    // Chromaticity CIE Lab a*, b* delta against D65 (Xn=0.95047, Yn=1.0, Zn=1.08883) at equal luminance
+    // Perceptual CIEDE2000 (ΔE00) chromaticity difference against CIE D65 at equal luminance
     let xn = y * (0.3127 / 0.3290);
     let zn = y * ((1.0 - 0.3127 - 0.3290) / 0.3290);
-    let f = |t: f64| -> f64 {
-        let delta: f64 = 6.0 / 29.0;
-        if t > delta.powi(3) {
-            t.cbrt()
-        } else {
-            t / (3.0 * delta.powi(2)) + 4.0 / 29.0
-        }
-    };
-    let fx = f(x / xn.max(1e-6));
-    let fy = f(1.0);
-    let fz = f(z / zn.max(1e-6));
-    let a_star = 500.0 * (fx - fy);
-    let b_star = 200.0 * (fy - fz);
-    let delta_e = (a_star.powi(2) + b_star.powi(2)).sqrt();
+    let lab_meas = xyz_to_lab(x, y, z, xn, y, zn);
+    let delta_e00 = ciede2000((100.0, 0.0, 0.0), lab_meas);
 
-    (rgb_pct, cct, delta_e)
+    (rgb_pct, cct, delta_e00)
 }
 
 /// Draw a horizontal center-zero deviation gauge bar.
@@ -2197,19 +2186,42 @@ impl eframe::App for YutaniApp {
 
                         ui.add_space(8.0);
                         ui.separator();
-                        ui.label("GRAYSCALE EOTF TRACKING & APPLIED 8-BIT VCGT LUT CORRECTION:");
+                        let mut gray_de00_sum = 0.0f64;
+                        let mut gray_de00_max = 0.0f64;
+                        let mut gray_de00_count = 0usize;
+                        for (v, reading) in &measurements.grayscale {
+                            if *v > 0.005 {
+                                let (_, de00_full) =
+                                    evaluate_grayscale_de00(*v, reading, lw, lb, current_eotf);
+                                gray_de00_sum += de00_full;
+                                if de00_full > gray_de00_max {
+                                    gray_de00_max = de00_full;
+                                }
+                                gray_de00_count += 1;
+                            }
+                        }
+                        let gray_de00_mean = if gray_de00_count > 0 {
+                            gray_de00_sum / (gray_de00_count as f64)
+                        } else {
+                            0.0
+                        };
+                        ui.label(format!(
+                            "GRAYSCALE EOTF TRACKING & 8-BIT VCGT LUT // UNCORRECTED MEAN ΔE00 = {:.2} (MAX {:.2}):",
+                            gray_de00_mean, gray_de00_max
+                        ));
                         for (v, reading) in &measurements.grayscale {
                             let target_y = eotf_target_luminance(*v, lw, lb, current_eotf);
                             let (gx, gy, meas_y) = reading.to_xyy();
                             let dy = meas_y - target_y;
-                            let (_, _, de) = compute_d65_alignment_metrics(reading);
+                            let (de00_ch, de00_full) =
+                                evaluate_grayscale_de00(*v, reading, lw, lb, current_eotf);
                             let in_8bit = (v * 255.0).round() as i32;
                             let lut_rgb = vcgt_summary.sample_rgb(*v);
                             let r_8bit = (lut_rgb[0] * 255.0).round() as i32;
                             let g_8bit = (lut_rgb[1] * 255.0).round() as i32;
                             let b_8bit = (lut_rgb[2] * 255.0).round() as i32;
                             ui.monospace(format!(
-                                "  {:>3.0}% (In {:>3}) | Meas: {:>6.2} | Tgt: {:>6.2} (ΔY {:+5.2}) | xy:({:.4},{:.4}) ΔE:{:>4.2} | LUT Out R:{:>3}({:+3}) G:{:>3}({:+3}) B:{:>3}({:+3})",
+                                "  {:>3.0}% (In {:>3}) | Meas:{:>6.2} Tgt:{:>6.2} (ΔY {:+5.2}) | xy:({:.4},{:.4}) ΔE00:{:>4.2}(C:{:>4.2}) | LUT R:{:>3}({:+3}) G:{:>3}({:+3}) B:{:>3}({:+3})",
                                 v * 100.0,
                                 in_8bit,
                                 meas_y,
@@ -2217,7 +2229,8 @@ impl eframe::App for YutaniApp {
                                 dy,
                                 gx,
                                 gy,
-                                de,
+                                de00_full,
+                                de00_ch,
                                 r_8bit,
                                 r_8bit - in_8bit,
                                 g_8bit,

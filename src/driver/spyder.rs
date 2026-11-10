@@ -338,6 +338,61 @@ impl SpyderSession {
             sample_count: 1,
         })
     }
+
+    /// Take an optical CIE XYZ measurement, automatically averaging 3 consecutive reads
+    /// on near-black / shadow-toe patches (`raw_counts <= 35`) when `dark_averaging` is enabled
+    /// to reduce 16-bit ADC quantization noise.
+    pub fn measure_adaptive(&self, dark_averaging: bool) -> Result<XyzReading> {
+        let first = self.measure()?;
+        let max_raw = first
+            .raw_counts
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+
+        if !dark_averaging || max_raw > 35 {
+            return Ok(first);
+        }
+
+        const EXTRA_SAMPLES: usize = 2;
+        let total = 1 + EXTRA_SAMPLES;
+        let mut sum_x = first.x;
+        let mut sum_y = first.y;
+        let mut sum_z = first.z;
+        let mut sum_net = first.net_counts;
+        let mut sum_raw = [
+            first.raw_counts[0] as u32,
+            first.raw_counts[1] as u32,
+            first.raw_counts[2] as u32,
+        ];
+
+        for _ in 0..EXTRA_SAMPLES {
+            let r = self.measure()?;
+            sum_x += r.x;
+            sum_y += r.y;
+            sum_z += r.z;
+            for c in 0..3 {
+                sum_net[c] += r.net_counts[c];
+                sum_raw[c] += r.raw_counts[c] as u32;
+            }
+        }
+
+        let inv = 1.0 / (total as f64);
+        Ok(XyzReading {
+            x: sum_x * inv,
+            y: sum_y * inv,
+            z: sum_z * inv,
+            raw_counts: [
+                ((sum_raw[0] as f64) * inv).round() as u16,
+                ((sum_raw[1] as f64) * inv).round() as u16,
+                ((sum_raw[2] as f64) * inv).round() as u16,
+            ],
+            secondary_raw_counts: first.secondary_raw_counts,
+            net_counts: [sum_net[0] * inv, sum_net[1] * inv, sum_net[2] * inv],
+            sample_count: total,
+        })
+    }
 }
 
 fn parse_fw_and_serial(init_resp: &[u8]) -> (String, String) {

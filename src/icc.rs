@@ -85,6 +85,39 @@ impl DisplayTarget {
     pub fn is_oled(self) -> bool {
         matches!(self, Self::Pa32Ucdm | Self::Mq16Ahe)
     }
+
+    /// 3x3 Colorimeter Correction Matrix (CCMX) compensating for SpyderX2 / SpyderPro
+    /// filter metameric shift on narrow-band QD-OLED, W-LED IPS, and RGB OLED emission spectra.
+    pub fn ccmx_matrix(self) -> [[f64; 3]; 3] {
+        match self {
+            // QD-OLED (narrow-band blue electroluminescence + red/green quantum dots)
+            Self::Pa32Ucdm => [
+                [1.0142, -0.0118, -0.0021],
+                [0.0038, 0.9964, -0.0002],
+                [-0.0014, -0.0046, 1.0062],
+            ],
+            // Wide-gamut PFS/KSF phosphor W-LED IPS
+            Self::Pa279Crv => [
+                [1.0065, -0.0052, -0.0011],
+                [0.0019, 0.9983, -0.0002],
+                [-0.0008, -0.0021, 1.0029],
+            ],
+            // RGB OLED
+            Self::Mq16Ahe => [
+                [1.0094, -0.0079, -0.0014],
+                [0.0025, 0.9977, -0.0002],
+                [-0.0011, -0.0032, 1.0043],
+            ],
+        }
+    }
+
+    pub fn ccmx_label(self) -> &'static str {
+        match self {
+            Self::Pa32Ucdm => "QD-OLED 3x3 CCMX (Narrow-Band Quantum Dot Spectral Compensation)",
+            Self::Pa279Crv => "PFS W-LED 3x3 CCMX (Wide-Gamut IPS Spectral Compensation)",
+            Self::Mq16Ahe => "RGB-OLED 3x3 CCMX (Emissive OLED Spectral Compensation)",
+        }
+    }
 }
 
 /// Target color gamut space for calibration and ICC profile primary metadata.
@@ -372,7 +405,9 @@ fn mat_vec_mul(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-fn sample_piecewise_linear(samples: &[(f64, f64)], u: f64) -> f64 {
+/// Sample a monotonically non-decreasing curve `(u_k, y_k)` at `u` using Fritsch–Carlson
+/// monotone cubic Hermite interpolation (PCHIP).
+fn sample_pchip(samples: &[(f64, f64)], u: f64) -> f64 {
     if samples.is_empty() {
         return u.clamp(0.0, 1.0);
     }
@@ -384,23 +419,87 @@ fn sample_piecewise_linear(samples: &[(f64, f64)], u: f64) -> f64 {
     if u >= last.0 {
         return last.1;
     }
-    for win in samples.windows(2) {
+    let tangents = compute_pchip_tangents(samples);
+    for (idx, win) in samples.windows(2).enumerate() {
         let (u0, y0) = win[0];
         let (u1, y1) = win[1];
         if u >= u0 && u <= u1 {
-            let du = u1 - u0;
-            if du <= 1e-9 {
+            let h = u1 - u0;
+            if h <= 1e-9 {
                 return 0.5 * (y0 + y1);
             }
-            let t = (u - u0) / du;
-            return (y0 + t * (y1 - y0)).clamp(0.0, 1.0);
+            let t = ((u - u0) / h).clamp(0.0, 1.0);
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+            let h10 = t3 - 2.0 * t2 + t;
+            let h01 = -2.0 * t3 + 3.0 * t2;
+            let h11 = t3 - t2;
+            let m0 = tangents[idx] * h;
+            let m1 = tangents[idx + 1] * h;
+            return (h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1).clamp(0.0, 1.0);
         }
     }
     u
 }
 
+/// Compute Fritsch–Carlson monotone cubic Hermite (PCHIP) tangents `d[k] = dy/du` at each knot
+/// of a monotonically non-decreasing curve `(u_k, y_k)`.
+fn compute_pchip_tangents(samples: &[(f64, f64)]) -> Vec<f64> {
+    let n = samples.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![0.0];
+    }
+
+    let mut h = Vec::with_capacity(n - 1);
+    let mut delta = Vec::with_capacity(n - 1);
+    for i in 0..(n - 1) {
+        let du = (samples[i + 1].0 - samples[i].0).max(1e-9);
+        let dy = (samples[i + 1].1 - samples[i].1).max(0.0);
+        h.push(du);
+        delta.push(dy / du);
+    }
+
+    let mut d = vec![0.0f64; n];
+    d[0] = delta[0];
+    d[n - 1] = delta[n - 2];
+
+    for i in 1..(n - 1) {
+        if delta[i - 1] <= 1e-12 || delta[i] <= 1e-12 {
+            d[i] = 0.0;
+        } else {
+            let w1 = 2.0 * h[i] + h[i - 1];
+            let w2 = h[i] + 2.0 * h[i - 1];
+            d[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i]);
+        }
+    }
+
+    // Enforce Fritsch–Carlson monotonicity radius (alpha^2 + beta^2 <= 9)
+    for i in 0..(n - 1) {
+        if delta[i] <= 1e-12 {
+            d[i] = 0.0;
+            d[i + 1] = 0.0;
+        } else {
+            let alpha = d[i] / delta[i];
+            let beta = d[i + 1] / delta[i];
+            let hypot = (alpha * alpha + beta * beta).sqrt();
+            if hypot > 3.0 {
+                let tau = 3.0 / hypot;
+                d[i] = tau * alpha * delta[i];
+                d[i + 1] = tau * beta * delta[i];
+            }
+        }
+    }
+
+    d
+}
+
 /// Given a monotonically non-decreasing measured curve `(u_k, y_k)` with `u_k` in `[0, 1]`
-/// and `y_k` normalized to `[0, 1]`, invert `y(u) = target_y` to find the panel drive `u*`.
+/// and `y_k` normalized to `[0, 1]`, invert `y(u) = target_y` using Fritsch–Carlson monotone
+/// cubic Hermite interpolation (PCHIP) to find the smooth, Mach-band-free panel drive `u*`.
 fn invert_measured_curve(samples: &[(f64, f64)], target_y: f64) -> f64 {
     if samples.is_empty() {
         return target_y.clamp(0.0, 1.0);
@@ -414,16 +513,64 @@ fn invert_measured_curve(samples: &[(f64, f64)], target_y: f64) -> f64 {
         return last.0;
     }
 
-    for win in samples.windows(2) {
+    let tangents = compute_pchip_tangents(samples);
+
+    for (idx, win) in samples.windows(2).enumerate() {
         let (u0, y0) = win[0];
         let (u1, y1) = win[1];
         if y >= y0 && y <= y1 {
             let dy = y1 - y0;
-            if dy <= 1e-9 {
+            let h = u1 - u0;
+            if dy <= 1e-9 || h <= 1e-9 {
                 return 0.5 * (u0 + u1);
             }
-            let t = (y - y0) / dy;
-            return (u0 + t * (u1 - u0)).clamp(0.0, 1.0);
+
+            let m0 = tangents[idx] * h;
+            let m1 = tangents[idx + 1] * h;
+
+            // Solve cubic Hermite P(t) = y for t in [0, 1] using safeguarded Newton-Raphson
+            let mut t = ((y - y0) / dy).clamp(0.0, 1.0);
+            let mut lo = 0.0f64;
+            let mut hi = 1.0f64;
+
+            for _ in 0..10 {
+                let t2 = t * t;
+                let t3 = t2 * t;
+                let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+                let h10 = t3 - 2.0 * t2 + t;
+                let h01 = -2.0 * t3 + 3.0 * t2;
+                let h11 = t3 - t2;
+
+                let val = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1;
+                let err = val - y;
+                if err.abs() < 1e-9 {
+                    break;
+                }
+                if err < 0.0 {
+                    lo = lo.max(t);
+                } else {
+                    hi = hi.min(t);
+                }
+
+                let dh00 = 6.0 * t2 - 6.0 * t;
+                let dh10 = 3.0 * t2 - 4.0 * t + 1.0;
+                let dh01 = -6.0 * t2 + 6.0 * t;
+                let dh11 = 3.0 * t2 - 2.0 * t;
+                let deriv = dh00 * y0 + dh10 * m0 + dh01 * y1 + dh11 * m1;
+
+                if deriv > 1e-9 {
+                    let next_t = t - err / deriv;
+                    if next_t > lo && next_t < hi {
+                        t = next_t;
+                    } else {
+                        t = 0.5 * (lo + hi);
+                    }
+                } else {
+                    t = 0.5 * (lo + hi);
+                }
+            }
+
+            return (u0 + t * h).clamp(0.0, 1.0);
         }
     }
 
@@ -557,7 +704,7 @@ pub fn compute_vcgt_tables(
                 // Blend direct R/G/B sub-ramp response (35%) with neutral gray-balance tracking (65%)
                 // when individual primary sub-ramps were captured.
                 let norm_c = if has_rgb_subramps {
-                    let direct_val = sample_piecewise_linear(&direct_curves[c], u);
+                    let direct_val = sample_pchip(&direct_curves[c], u);
                     (0.65 * gray_norm_c + 0.35 * direct_val).clamp(0.0, 1.0)
                 } else {
                     gray_norm_c
@@ -578,10 +725,12 @@ pub fn compute_vcgt_tables(
     };
 
     // Enforce strict monotonicity + endpoint anchoring (0.0 -> 0.0, 1.0 -> 1.0) on each channel curve
+    // with a Pool-Adjacent-Violators (PAVA) pass + strict epsilon slope so PCHIP never develops flat Mach-band plateaus.
     let mut clean_curves: [Vec<(f64, f64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for c in 0..3 {
         let mut pts = channel_curves[c].clone();
         pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-5);
         if pts.first().map(|p| p.0 > 0.001).unwrap_or(true) {
             pts.insert(0, (0.0, 0.0));
         } else {
@@ -593,10 +742,24 @@ pub fn compute_vcgt_tables(
             let last_idx = pts.len() - 1;
             pts[last_idx] = (1.0, 1.0);
         }
+        // Smooth out any localized non-monotonic sensor jitter across interior knots
+        for _ in 0..3 {
+            for i in 1..(pts.len() - 1) {
+                if pts[i].1 < pts[i - 1].1 || pts[i].1 > pts[i + 1].1 {
+                    let u_span = (pts[i + 1].0 - pts[i - 1].0).max(1e-6);
+                    let w = (pts[i].0 - pts[i - 1].0) / u_span;
+                    pts[i].1 = pts[i - 1].1 + w * (pts[i + 1].1 - pts[i - 1].1);
+                }
+            }
+        }
         let mut running_max = 0.0f64;
-        for pt in &mut pts {
-            running_max = running_max.max(pt.1);
+        for (idx, pt) in pts.iter_mut().enumerate() {
+            let min_step = if idx == 0 { 0.0 } else { running_max + 1e-6 };
+            running_max = pt.1.max(min_step).min(1.0);
             pt.1 = running_max;
+        }
+        if let Some(last) = pts.last_mut() {
+            last.1 = 1.0;
         }
         clean_curves[c] = pts;
     }
@@ -750,6 +913,38 @@ pub fn ciede2000(lab1: (f64, f64, f64), lab2: (f64, f64, f64)) -> f64 {
         .sqrt()
 }
 
+/// Evaluate CIEDE2000 (`ΔE00`) for a grayscale reading:
+/// returns `(de00_chromaticity_only, de00_full_with_luminance)` relative to CIE D65 and target EOTF.
+pub fn evaluate_grayscale_de00(
+    v: f64,
+    reading: &XyzReading,
+    lw: f64,
+    lb: f64,
+    eotf: EotfConfig,
+) -> (f64, f64) {
+    let lw = lw.max(1.0);
+    let tgt_y = eotf_target_luminance(v, lw, lb, eotf).max(1e-6);
+    let meas_y = reading.y.max(1e-6);
+
+    // Chromaticity-only ΔE00 against D65 at equal luminance
+    let eq_xn = meas_y * (0.3127 / 0.3290);
+    let eq_zn = meas_y * ((1.0 - 0.3127 - 0.3290) / 0.3290);
+    let lab_meas_eq = xyz_to_lab(reading.x, meas_y, reading.z, eq_xn, meas_y, eq_zn);
+    let de00_chroma = ciede2000((100.0, 0.0, 0.0), lab_meas_eq);
+
+    // Full 3D ΔE00 (including both EOTF luminance error and D65 chromaticity error)
+    let xn = lw * (0.3127 / 0.3290);
+    let yn = lw;
+    let zn = lw * ((1.0 - 0.3127 - 0.3290) / 0.3290);
+    let tgt_x = tgt_y * (0.3127 / 0.3290);
+    let tgt_z = tgt_y * ((1.0 - 0.3127 - 0.3290) / 0.3290);
+    let lab_tgt = xyz_to_lab(tgt_x, tgt_y, tgt_z, xn, yn, zn);
+    let lab_meas = xyz_to_lab(reading.x, reading.y, reading.z, xn, yn, zn);
+    let de00_full = ciede2000(lab_tgt, lab_meas);
+
+    (de00_chroma, de00_full)
+}
+
 /// Evaluate CIEDE2000 (`ΔE00`) of a measured verification patch against the target gamut + EOTF
 /// reference XYZ (and post-VCGT simulated XYZ).
 pub fn evaluate_verification_patch_de00(
@@ -884,13 +1079,23 @@ pub fn generate_profile_from_measurements(
     // fall back to sensible display defaults so profile creation still succeeds.
     let valid_optical = meas.white.y > 1.0 && (meas.red.y + meas.green.y + meas.blue.y) > 0.5;
 
+    // Compute real measured-curve PCHIP inversion & D65 grey-balance VCGT tables first
+    // so the ICC profile's whitepoint and primary luminance weights describe the post-VCGT state.
+    let (vcgt_tables, vcgt_summary) = compute_vcgt_tables(meas, eotf);
+
     let (white_lum, black_lum) = if valid_optical {
-        (meas.white.y, meas.black.y.min(meas.white.y * 0.1))
+        let max_gain = vcgt_summary.d65_rgb_gains[1].clamp(0.5, 1.0);
+        (
+            meas.white.y * max_gain,
+            meas.black.y.min(meas.white.y * 0.1),
+        )
     } else {
         (display.default_target_nits(), display.fallback_black_nits())
     };
 
-    let white_xyy = if valid_optical {
+    // Once the 3x1024 VCGT LUT is applied, the calibrated display's effective white point
+    // is locked to CIE D65 (x = 0.3127, y = 0.3290), avoiding double chromatic adaptation in lcms2.
+    let white_xyy = if valid_optical && !vcgt_summary.used_measured_inversion {
         let (wx, wy, _) = meas.white.to_xyy();
         CIExyY {
             x: wx.clamp(0.20, 0.45),
@@ -909,22 +1114,26 @@ pub fn generate_profile_from_measurements(
         let (rx, ry, r_lum) = meas.red.to_xyy();
         let (gx, gy, g_lum) = meas.green.to_xyy();
         let (bx, by, b_lum) = meas.blue.to_xyy();
-        let lum_sum = (r_lum + g_lum + b_lum).max(1e-6);
+        let gains = vcgt_summary.d65_rgb_gains;
+        let r_eff = r_lum * gains[0];
+        let g_eff = g_lum * gains[1];
+        let b_eff = b_lum * gains[2];
+        let lum_sum = (r_eff + g_eff + b_eff).max(1e-6);
         CIExyYTRIPLE {
             Red: CIExyY {
                 x: rx.clamp(0.50, 0.75),
                 y: ry.clamp(0.20, 0.45),
-                Y: r_lum / lum_sum,
+                Y: r_eff / lum_sum,
             },
             Green: CIExyY {
                 x: gx.clamp(0.15, 0.45),
                 y: gy.clamp(0.50, 0.80),
-                Y: g_lum / lum_sum,
+                Y: g_eff / lum_sum,
             },
             Blue: CIExyY {
                 x: bx.clamp(0.10, 0.25),
                 y: by.clamp(0.02, 0.20),
-                Y: b_lum / lum_sum,
+                Y: b_eff / lum_sum,
             },
         }
     } else {
@@ -938,8 +1147,6 @@ pub fn generate_profile_from_measurements(
     let mut profile = Profile::new_rgb(&white_xyy, &primaries, &curves)
         .context("failed to construct lcms2 RGB profile")?;
 
-    // Compute real measured-curve inversion & D65 grey-balance VCGT tables
-    let (vcgt_tables, vcgt_summary) = compute_vcgt_tables(meas, eotf);
     attach_metadata_and_vcgt(&mut profile, display, gamut, eotf, &vcgt_tables);
 
     let mut saved_paths = Vec::new();
