@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::driver::spyder::{SpyderSession, XyzReading};
+use crate::driver::spyder::{CmdSet, SpyderWorker, XyzReading};
 use crate::icc::{
     bt1886_params, ciede2000, eotf_target_luminance, evaluate_grayscale_de00,
     evaluate_verification_patch_de00, generate_profile_from_measurements, xyz_to_lab,
@@ -130,6 +130,8 @@ impl PatchPreset {
 struct PatchSpec {
     label: &'static str,
     color: egui::Color32,
+    /// Exact normalized `[R, G, B]` stimulus in `0.0..=1.0` for 10-bit/12-bit spatio-temporal FRC dithering.
+    exact_rgb: [f64; 3],
     kind: PatchKind,
 }
 
@@ -155,26 +157,31 @@ fn build_calibration_patches(preset: PatchPreset) -> Vec<PatchSpec> {
         PatchSpec {
             label: "BLACK LEVEL (0%)",
             color: egui::Color32::from_rgb(0, 0, 0),
+            exact_rgb: [0.0, 0.0, 0.0],
             kind: PatchKind::Black,
         },
         PatchSpec {
             label: "PEAK WHITE (100%)",
             color: egui::Color32::from_rgb(255, 255, 255),
+            exact_rgb: [1.0, 1.0, 1.0],
             kind: PatchKind::White,
         },
         PatchSpec {
             label: "RED PRIMARY (100%)",
             color: egui::Color32::from_rgb(255, 0, 0),
+            exact_rgb: [1.0, 0.0, 0.0],
             kind: PatchKind::Red,
         },
         PatchSpec {
             label: "GREEN PRIMARY (100%)",
             color: egui::Color32::from_rgb(0, 255, 0),
+            exact_rgb: [0.0, 1.0, 0.0],
             kind: PatchKind::Green,
         },
         PatchSpec {
             label: "BLUE PRIMARY (100%)",
             color: egui::Color32::from_rgb(0, 0, 255),
+            exact_rgb: [0.0, 0.0, 1.0],
             kind: PatchKind::Blue,
         },
     ];
@@ -217,6 +224,7 @@ fn build_calibration_patches(preset: PatchPreset) -> Vec<PatchSpec> {
         patches.push(PatchSpec {
             label,
             color: egui::Color32::from_rgb(level, level, level),
+            exact_rgb: [v, v, v],
             kind: PatchKind::Gray(v),
         });
     }
@@ -239,14 +247,15 @@ fn build_calibration_patches(preset: PatchPreset) -> Vec<PatchSpec> {
         ];
         for &(label, ch, level) in sub_ramps {
             let u = (level * 255.0).round() as u8;
-            let color = match ch {
-                0 => egui::Color32::from_rgb(u, 0, 0),
-                1 => egui::Color32::from_rgb(0, u, 0),
-                _ => egui::Color32::from_rgb(0, 0, u),
+            let (color, exact_rgb) = match ch {
+                0 => (egui::Color32::from_rgb(u, 0, 0), [level, 0.0, 0.0]),
+                1 => (egui::Color32::from_rgb(0, u, 0), [0.0, level, 0.0]),
+                _ => (egui::Color32::from_rgb(0, 0, u), [0.0, 0.0, level]),
             };
             patches.push(PatchSpec {
                 label,
                 color,
+                exact_rgb,
                 kind: PatchKind::PrimaryRamp { channel: ch, level },
             });
         }
@@ -289,6 +298,7 @@ fn build_calibration_patches(preset: PatchPreset) -> Vec<PatchSpec> {
             patches.push(PatchSpec {
                 label,
                 color: egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                exact_rgb: stimulus_rgb,
                 kind: PatchKind::Verification {
                     label,
                     stimulus_rgb,
@@ -298,6 +308,201 @@ fn build_calibration_patches(preset: PatchPreset) -> Vec<PatchSpec> {
     }
 
     patches
+}
+
+/// Render an optical calibration patch with optional 10-bit/12-bit Spatio-Temporal FRC Dithering.
+///
+/// Because `egui::Color32` quantizes RGB stimuli to 8-bit integers (`0..=255`), fractional patches
+/// such as `2% = 5.10/255`, `4% = 10.20/255`, `6% = 15.30/255`, `8% = 20.40/255`, `15% = 38.25/255`,
+/// `95% = 242.25/255`, and `98% = 249.90/255` suffer up to `0.40 LSB` quantization error in 8-bit mode.
+/// When `enable_frc` is enabled, this function fills the patch with `floor(c * 255)` and overlays a
+/// 4x4 Bayer spatial + temporal phase-shifted micro-grid inside the center sensor aperture so the
+/// Spyder photodiode integrates the exact floating-point stimulus over its 714 ms integration window.
+fn draw_frc_dithered_patch(
+    painter: &egui::Painter,
+    patch_rect: egui::Rect,
+    exact_rgb: [f64; 3],
+    fallback_color: egui::Color32,
+    frame_parity: u64,
+    enable_frc: bool,
+) -> bool {
+    if !enable_frc {
+        painter.rect_filled(patch_rect, 0.0, fallback_color);
+        return false;
+    }
+
+    let scaled = [
+        (exact_rgb[0].clamp(0.0, 1.0) * 255.0),
+        (exact_rgb[1].clamp(0.0, 1.0) * 255.0),
+        (exact_rgb[2].clamp(0.0, 1.0) * 255.0),
+    ];
+    let lo = [
+        scaled[0].floor() as u8,
+        scaled[1].floor() as u8,
+        scaled[2].floor() as u8,
+    ];
+    let hi = [
+        (lo[0] as u16 + 1).min(255) as u8,
+        (lo[1] as u16 + 1).min(255) as u8,
+        (lo[2] as u16 + 1).min(255) as u8,
+    ];
+    let frac = [
+        scaled[0] - (lo[0] as f64),
+        scaled[1] - (lo[1] as f64),
+        scaled[2] - (lo[2] as f64),
+    ];
+
+    let has_fractional = frac.iter().any(|&f| f > 0.01 && f < 0.99);
+    if !has_fractional {
+        painter.rect_filled(patch_rect, 0.0, fallback_color);
+        return false;
+    }
+
+    let lo_color = egui::Color32::from_rgb(lo[0], lo[1], lo[2]);
+    painter.rect_filled(patch_rect, 0.0, lo_color);
+
+    // 4x4 ordered Bayer matrix thresholds in 0..16
+    const BAYER_4X4: [[u8; 4]; 4] = [
+        [0, 8, 2, 10],
+        [12, 4, 14, 6],
+        [3, 11, 1, 9],
+        [15, 7, 13, 5],
+    ];
+
+    // Subdivide the center 240x240 sensor aperture into a 24x24 micro-cell grid (10x10 px per cell)
+    // phase-shifted by `frame_parity` each frame so both spatial and temporal integration average out.
+    let aperture = egui::Rect::from_center_size(patch_rect.center(), egui::vec2(240.0, 240.0))
+        .intersect(patch_rect);
+    let grid_n = 24usize;
+    let cell_w = aperture.width() / (grid_n as f32);
+    let cell_h = aperture.height() / (grid_n as f32);
+    let phase_x = (frame_parity as usize) & 3;
+    let phase_y = ((frame_parity as usize) >> 2) & 3;
+
+    for gy in 0..grid_n {
+        for gx in 0..grid_n {
+            let bayer_val = BAYER_4X4[(gy + phase_y) & 3][(gx + phase_x) & 3] as f64;
+            let threshold = (bayer_val + 0.5) / 16.0;
+            let r_u8 = if frac[0] > threshold { hi[0] } else { lo[0] };
+            let g_u8 = if frac[1] > threshold { hi[1] } else { lo[1] };
+            let b_u8 = if frac[2] > threshold { hi[2] } else { lo[2] };
+            if r_u8 != lo[0] || g_u8 != lo[1] || b_u8 != lo[2] {
+                let cell_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        aperture.left() + (gx as f32) * cell_w,
+                        aperture.top() + (gy as f32) * cell_h,
+                    ),
+                    egui::pos2(
+                        aperture.left() + ((gx + 1) as f32) * cell_w,
+                        aperture.top() + ((gy + 1) as f32) * cell_h,
+                    ),
+                );
+                painter.rect_filled(cell_rect, 0.0, egui::Color32::from_rgb(r_u8, g_u8, b_u8));
+            }
+        }
+    }
+    true
+}
+
+/// Probe the active Wayland / KWin / `colord` display color management state.
+///
+/// Checks `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, and queries `kscreen-doctor -o` or `colormgr`
+/// if available on the host to warn when an existing ICC profile is active during calibration.
+fn probe_wayland_color_environment() -> String {
+    let wayland_disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| String::from("unset"));
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| String::from("unknown"));
+    let session_type =
+        std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| String::from("unknown"));
+
+    // 1. Check KWin / KDE Plasma outputs via `kscreen-doctor -o` if installed
+    if let Ok(output) = std::process::Command::new("kscreen-doctor")
+        .arg("-o")
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut icc_active = false;
+            for line in stdout.lines() {
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("icc profile:") && !lower.contains("none") {
+                    icc_active = true;
+                    break;
+                }
+            }
+            let icc_note = if icc_active {
+                "WARNING: Active KWin ICC profile detected! Set Color Profile to 'None' before measuring."
+            } else {
+                "KWin ICC Bypass Verified (No active ICC profile reported by kscreen-doctor)."
+            };
+            return format!(
+                "WAYLAND [{wayland_disp}] // DESKTOP [{desktop}] // {icc_note}"
+            );
+        }
+    }
+
+    // 2. Check colord display devices via `colormgr` if installed
+    if let Ok(output) = std::process::Command::new("colormgr")
+        .arg("get-devices-by-kind")
+        .arg("display")
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let dev_count = stdout.lines().filter(|l| l.contains("Object Path:")).count();
+            return format!(
+                "WAYLAND [{wayland_disp}] // SESSION [{session_type}/{desktop}] // colord active ({dev_count} display device(s))"
+            );
+        }
+    }
+
+    format!(
+        "WAYLAND [{wayland_disp}] // SESSION [{session_type}/{desktop}] // Ensure compositor ICC profile is set to 'None' before calibration"
+    )
+}
+
+/// Copy a generated `.icc` profile into the standard XDG / `colord` user ICC directories
+/// (`~/.local/share/icc/` and `~/.color/icc/`) and import it into `colord` via `colormgr` if present.
+fn install_and_register_icc_profile(
+    profile_path: &std::path::Path,
+    display: DisplayTarget,
+) -> Result<String, String> {
+    let file_name = profile_path
+        .file_name()
+        .ok_or_else(|| String::from("Invalid ICC profile filename"))?;
+
+    let home = std::env::var("HOME").map_err(|_| String::from("HOME environment variable not set"))?;
+    let home_path = PathBuf::from(home);
+    let xdg_icc_dir = home_path.join(".local/share/icc");
+    let legacy_icc_dir = home_path.join(".color/icc");
+
+    std::fs::create_dir_all(&xdg_icc_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", xdg_icc_dir.display()))?;
+    let dest_xdg = xdg_icc_dir.join(file_name);
+    std::fs::copy(profile_path, &dest_xdg)
+        .map_err(|e| format!("Failed to copy ICC to {}: {e}", dest_xdg.display()))?;
+
+    if std::fs::create_dir_all(&legacy_icc_dir).is_ok() {
+        let _ = std::fs::copy(profile_path, legacy_icc_dir.join(file_name));
+    }
+
+    // Attempt `colormgr import-profile <dest_xdg>` if colord CLI is available
+    let colormgr_note = match std::process::Command::new("colormgr")
+        .arg("import-profile")
+        .arg(&dest_xdg)
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from("colord: imported via colormgr"),
+        Ok(_) => String::from("colord: indexed in ~/.local/share/icc"),
+        Err(_) => String::from("installed to ~/.local/share/icc (colormgr not on PATH)"),
+    };
+
+    Ok(format!(
+        "INSTALLED {} FOR {} -> {} ({})",
+        file_name.to_string_lossy(),
+        display.short_code().to_ascii_uppercase(),
+        dest_xdg.display(),
+        colormgr_note
+    ))
 }
 
 /// Interval between consecutive sensor reads in Live OSD Alignment mode.
@@ -1250,18 +1455,24 @@ enum AppPhase {
         measurements: CalibrationMeasurements,
         vcgt_summary: VcgtSummary,
         saved_paths: Vec<PathBuf>,
+        install_status: Option<String>,
     },
 }
 
 struct YutaniApp {
-    session: Option<SpyderSession>,
+    session: Option<SpyderWorker>,
     status_log: String,
+    wayland_env_status: String,
     last_single_read: Option<XyzReading>,
     display_target: DisplayTarget,
     color_gamut: ColorGamut,
     eotf: EotfConfig,
     patch_preset: PatchPreset,
     oled_windowed_apl: bool,
+    apply_panel_ccmx: bool,
+    dark_patch_averaging: bool,
+    ten_bit_frc_dither: bool,
+    frame_counter: u64,
     target_nits: f64,
     phase: AppPhase,
     theme_applied: bool,
@@ -1273,12 +1484,17 @@ impl YutaniApp {
         let mut app = Self {
             session: None,
             status_log: String::from("SYSTEM READY. INITIALISING INSTRUMENT LINK..."),
+            wayland_env_status: probe_wayland_color_environment(),
             last_single_read: None,
             display_target: default_display,
             color_gamut: ColorGamut::default(),
             eotf: EotfConfig::default(),
             patch_preset: PatchPreset::default(),
             oled_windowed_apl: default_display.is_oled(),
+            apply_panel_ccmx: true,
+            dark_patch_averaging: true,
+            ten_bit_frc_dither: true,
+            frame_counter: 0,
             target_nits: default_display.default_target_nits(),
             phase: AppPhase::BootSequence {
                 started_at: Instant::now(),
@@ -1290,10 +1506,10 @@ impl YutaniApp {
     }
 
     fn connect_sensor(&mut self) {
-        match SpyderSession::open() {
+        match SpyderWorker::spawn() {
             Ok(s) => {
                 self.status_log = format!(
-                    "ONLINE: {} [{:04x}:{:04x} // {}] // FW: {} // SN: {} // INT: {} ms",
+                    "ONLINE (ASYNC WORKER): {} [{:04x}:{:04x} // {}] // FW: {} // SN: {} // INT: {} ms",
                     s.model_name,
                     s.vid_pid.0,
                     s.vid_pid.1,
@@ -1391,6 +1607,7 @@ impl YutaniApp {
                     measurements,
                     vcgt_summary,
                     saved_paths,
+                    install_status: None,
                 };
             }
             Err(e) => {
@@ -1403,6 +1620,7 @@ impl YutaniApp {
 
 impl eframe::App for YutaniApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame_counter = self.frame_counter.wrapping_add(1);
         if !self.theme_applied {
             configure_yutani_theme(ctx);
             self.theme_applied = true;
@@ -1421,6 +1639,10 @@ impl eframe::App for YutaniApp {
         let current_gamut = self.color_gamut;
         let current_preset = self.patch_preset;
         let current_windowed_apl = self.oled_windowed_apl;
+        let current_ccmx = self.apply_panel_ccmx;
+        let current_dark_avg = self.dark_patch_averaging;
+        let current_frc_dither = self.ten_bit_frc_dither;
+        let current_frame_parity = self.frame_counter;
 
         match &mut self.phase {
             AppPhase::BootSequence { started_at } => {
@@ -1501,6 +1723,20 @@ impl eframe::App for YutaniApp {
                             "10% Windowed Patch + 20% Neutral Gray APL Stabilizer (Prevents OLED ABL Dimming)",
                         );
                     });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(
+                            &mut self.apply_panel_ccmx,
+                            format!("Apply {}", self.display_target.ccmx_label()),
+                        );
+                        ui.checkbox(
+                            &mut self.dark_patch_averaging,
+                            "Adaptive 3-Sample Dark-Patch Averaging (Raw <= 35)",
+                        );
+                        ui.checkbox(
+                            &mut self.ten_bit_frc_dither,
+                            "10-Bit Spatio-Temporal FRC Dithering (4x4 Bayer + Frame Phase)",
+                        );
+                    });
 
                     ui.add_space(6.0);
                     ui.label(format!(
@@ -1515,14 +1751,24 @@ impl eframe::App for YutaniApp {
                         self.eotf.filename_for(self.display_target, self.color_gamut)
                     ));
                     ui.label("TARGET WHITE   : CIE D65 (x = 0.3127, y = 0.3290)");
+                    ui.label(format!("WAYLAND / CMS  : {}", self.wayland_env_status));
                     ui.label(format!("SENSOR STATUS  : {}", self.status_log));
 
                     if let Some(s) = &self.session {
                         ui.add_space(4.0);
                         ui.label(format!(
-                            "MATRIX ROW Y   : [{:+.6}, {:+.6}, {:+.6}] (setup_off = {:?})",
+                            "PRIMARY MAT Y  : [{:+.6}, {:+.6}, {:+.6}] (setup_off = {:?})",
                             s.matrix[1][0], s.matrix[1][1], s.matrix[1][2], s.setup_off
                         ));
+                        if s.cmd_set == CmdSet::SpyderX2 {
+                            ui.label(format!(
+                                "SECONDARY MAT Y: [{:+.6}, {:+.6}, {:+.6}] (sec_off = {:?})",
+                                s.secondary_matrix[1][0],
+                                s.secondary_matrix[1][1],
+                                s.secondary_matrix[1][2],
+                                s.secondary_setup_off
+                            ));
+                        }
                         let bcal_str = if s.black_calibrated {
                             format!(
                                 "ZEROED (CAP-ON VERIFIED) // bcal = [{:.2}, {:.2}, {:.2}] counts",
@@ -1624,11 +1870,14 @@ impl eframe::App for YutaniApp {
                         if ui.button(" [ RE-SCAN USB INSTRUMENT ] ").clicked() {
                             self.connect_sensor();
                         }
+                        if ui.button(" [ PROBE WAYLAND / COLORD ] ").clicked() {
+                            self.wayland_env_status = probe_wayland_color_environment();
+                        }
 
                         if self.session.is_some() {
                             if ui.button(" [ ZERO DARK OFFSET (CAP ON) ] ").clicked() {
                                 if let Some(s) = &mut self.session {
-                                    match s.calibrate_black() {
+                                    match s.calibrate_black_sync() {
                                         Ok(bcal) => {
                                             self.status_log = format!(
                                                 "DARK OFFSET ZEROED: bcal = [{:.2}, {:.2}, {:.2}] counts",
@@ -1636,31 +1885,29 @@ impl eframe::App for YutaniApp {
                                             );
                                         }
                                         Err(e) => {
-                                            self.status_log = format!("DARK ZERO FAILED: {e:#}");
+                                            self.status_log = format!("DARK ZERO FAILED: {e}");
                                         }
                                     }
                                 }
                             }
 
-                            if ui.button(" [ SINGLE READ (TEST SENSOR) ] ").clicked() {
-                                if let Some(s) = &self.session {
-                                    match s.measure() {
-                                        Ok(r) => {
-                                            let (x, y, lum) = r.to_xyy();
-                                            self.status_log = format!(
-                                                "READ OK: {:.3} cd/m² (x={:.4}, y={:.4}) raw={:?}",
-                                                lum, x, y, r.raw_counts
-                                            );
-                                            self.last_single_read = Some(r);
-                                        }
-                                        Err(e) => {
-                                            self.status_log = format!("READ FAILED: {e:#}");
-                                        }
+                            let is_busy = self.session.as_ref().map(|s| s.is_busy()).unwrap_or(false);
+                            let read_btn_label = if is_busy {
+                                " [ READING SENSOR (ASYNC)... ] "
+                            } else {
+                                " [ SINGLE READ (TEST SENSOR) ] "
+                            };
+                            if ui.button(read_btn_label).clicked() && !is_busy {
+                                if let Some(s) = &mut self.session {
+                                    if s.request_measure(current_dark_avg) {
+                                        self.status_log =
+                                            String::from("ACQUIRING OPTICAL SAMPLE ON WORKER THREAD...");
                                     }
                                 }
                             }
 
                             if ui.button(" [ LIVE OSD WHITE & NITS METER ] ").clicked() {
+                                self.wayland_env_status = probe_wayland_color_environment();
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                                 self.phase = AppPhase::OsdAlignment {
                                     last_poll: Instant::now() - OSD_POLL_INTERVAL,
@@ -1671,11 +1918,38 @@ impl eframe::App for YutaniApp {
                             }
 
                             if ui.button(" [ INITIALIZE CALIBRATION SEQUENCE ] ").clicked() {
+                                self.wayland_env_status = probe_wayland_color_environment();
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                                 self.phase = AppPhase::PlacementReticle;
                             }
                         }
                     });
+
+                    // Poll non-blocking single read if in flight on Dashboard
+                    if let Some(s) = &mut self.session {
+                        if let Some(res) = s.poll_measure() {
+                            match res {
+                                Ok(raw_r) => {
+                                    let r = if current_ccmx {
+                                        raw_r.apply_ccmx(current_display.ccmx_matrix())
+                                    } else {
+                                        raw_r
+                                    };
+                                    let (x, y, lum) = r.to_xyy();
+                                    self.status_log = format!(
+                                        "READ OK ({}x avg): {:.3} cd/m² (x={:.4}, y={:.4}) raw={:?}",
+                                        r.sample_count, lum, x, y, r.raw_counts
+                                    );
+                                    self.last_single_read = Some(r);
+                                }
+                                Err(e) => {
+                                    self.status_log = format!("READ FAILED: {e}");
+                                }
+                            }
+                        } else if s.is_busy() {
+                            ctx.request_repaint_after(Duration::from_millis(16));
+                        }
+                    }
 
                     if let Some(r) = self.last_single_read {
                         let (cx, cy, lum) = r.to_xyy();
@@ -1683,8 +1957,10 @@ impl eframe::App for YutaniApp {
                         ui.separator();
                         ui.label("TELEMETRY // LAST SPOT MEASUREMENT:");
                         ui.label(format!(
-                            "  Luminance (Y) : {:.4} cd/m² (nits)",
-                            lum
+                            "  Luminance (Y) : {:.4} cd/m² (nits) [Samples: {}x // CCMX: {}]",
+                            lum,
+                            r.sample_count,
+                            if current_ccmx { "ON" } else { "OFF" }
                         ));
                         ui.label(format!(
                             "  CIE 1931 xy   : x = {:.4}, y = {:.4}",
@@ -1695,13 +1971,14 @@ impl eframe::App for YutaniApp {
                             r.x, r.y, r.z
                         ));
                         ui.label(format!(
-                            "  Raw Counts    : R={} G={} B={} (Net: {:.1}, {:.1}, {:.1})",
+                            "  Raw Counts    : R={} G={} B={} (Net: {:.1}, {:.1}, {:.1}) | Sec Raw={:?}",
                             r.raw_counts[0],
                             r.raw_counts[1],
                             r.raw_counts[2],
                             r.net_counts[0],
                             r.net_counts[1],
-                            r.net_counts[2]
+                            r.net_counts[2],
+                            r.secondary_raw_counts
                         ));
                     }
                 });
@@ -1756,7 +2033,10 @@ impl eframe::App for YutaniApp {
                                 "1. Remove sensor lens cap and place flush against the {} panel.",
                                 current_display.full_name()
                             ));
-                            ui.label("2. Ensure KWin ICC profile is set to 'None' during raw panel characterization.");
+                            ui.label(format!(
+                                "2. Wayland/CMS Check: {}",
+                                self.wayland_env_status
+                            ));
                             ui.add_space(16.0);
                             ui.horizontal(|ui| {
                                 if ui.button(" [ LIVE OSD WHITE & NITS METER (O) ] ").clicked() {
@@ -1981,22 +2261,32 @@ impl eframe::App for YutaniApp {
                         readings: Vec::with_capacity(cap),
                     };
                     ctx.request_repaint();
-                } else if (!*paused && last_poll.elapsed() >= OSD_POLL_INTERVAL)
-                    || trigger_manual_read
-                {
-                    if let Some(s) = &self.session {
-                        if let Ok(r) = s.measure() {
+                } else if let Some(s) = &mut self.session {
+                    if let Some(res) = s.poll_measure() {
+                        if let Ok(raw_r) = res {
+                            let r = if current_ccmx {
+                                raw_r.apply_ccmx(current_display.ccmx_matrix())
+                            } else {
+                                raw_r
+                            };
                             *reading = Some(r);
                             self.last_single_read = Some(r);
                             *read_count += 1;
                         }
+                        *last_poll = Instant::now();
+                        if !*paused {
+                            ctx.request_repaint_after(OSD_POLL_INTERVAL);
+                        }
+                    } else if s.is_busy() {
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    } else if (!*paused && last_poll.elapsed() >= OSD_POLL_INTERVAL)
+                        || trigger_manual_read
+                    {
+                        let _ = s.request_measure(false);
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    } else if !*paused {
+                        ctx.request_repaint_after(OSD_POLL_INTERVAL - last_poll.elapsed());
                     }
-                    *last_poll = Instant::now();
-                    if !*paused {
-                        ctx.request_repaint_after(OSD_POLL_INTERVAL);
-                    }
-                } else if !*paused {
-                    ctx.request_repaint_after(OSD_POLL_INTERVAL - last_poll.elapsed());
                 }
             }
 
@@ -2021,12 +2311,21 @@ impl eframe::App for YutaniApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::default().fill(bg_fill))
                     .show(ctx, |ui| {
-                        if current_windowed_apl {
-                            let center = ui.max_rect().center();
-                            let patch_rect =
-                                egui::Rect::from_center_size(center, egui::vec2(360.0, 360.0));
-                            ui.painter().rect_filled(patch_rect, 0.0, spec.color);
-                        }
+                        let screen_rect = ui.max_rect();
+                        let center = screen_rect.center();
+                        let patch_rect = if current_windowed_apl {
+                            egui::Rect::from_center_size(center, egui::vec2(360.0, 360.0))
+                        } else {
+                            screen_rect
+                        };
+                        let dither_active = draw_frc_dithered_patch(
+                            ui.painter(),
+                            patch_rect,
+                            spec.exact_rgb,
+                            spec.color,
+                            current_frame_parity,
+                            current_frc_dither,
+                        );
 
                         // Small top-left corner status outside the center sensor zone
                         egui::Frame::default()
@@ -2034,7 +2333,7 @@ impl eframe::App for YutaniApp {
                             .inner_margin(8.0)
                             .show(ui, |ui| {
                                 ui.label(format!(
-                                    "YUTANI // PATCH {}/{} : {} [{}]  [ESC TO ABORT]",
+                                    "YUTANI // PATCH {}/{} : {} [{} // {}]  [ESC TO ABORT]",
                                     *current_index + 1,
                                     patches.len(),
                                     spec.label,
@@ -2042,6 +2341,11 @@ impl eframe::App for YutaniApp {
                                         "10% WINDOWED APL"
                                     } else {
                                         "FULLSCREEN"
+                                    },
+                                    if dither_active {
+                                        "10-BIT FRC DITHER"
+                                    } else {
+                                        "8-BIT INTEGER"
                                     }
                                 ));
                             });
@@ -2049,22 +2353,47 @@ impl eframe::App for YutaniApp {
 
                 let elapsed = patch_shown_at.elapsed();
                 if elapsed < PATCH_SETTLE_DURATION {
-                    // Keep repainting until the panel settle window completes
-                    ctx.request_repaint_after(PATCH_SETTLE_DURATION - elapsed);
-                } else if !*awaiting_read {
-                    // First frame after settle duration: ensure the patch frame is rendered, then trigger read on next frame
-                    *awaiting_read = true;
-                    ctx.request_repaint();
-                } else {
-                    // Perform synchronous hardware read for this settled patch
-                    let read_res = if let Some(s) = &self.session {
-                        s.measure()
+                    // Keep repainting at 60 Hz during settle if FRC temporal dithering is active
+                    if current_frc_dither {
+                        ctx.request_repaint_after(Duration::from_millis(16));
                     } else {
-                        Err(anyhow::anyhow!("Spyder session disconnected"))
+                        ctx.request_repaint_after(PATCH_SETTLE_DURATION - elapsed);
+                    }
+                } else if !*awaiting_read {
+                    // Panel has settled: dispatch non-blocking read to the Spyder worker thread
+                    if let Some(s) = &mut self.session {
+                        if s.request_measure(current_dark_avg) {
+                            *awaiting_read = true;
+                            ctx.request_repaint_after(Duration::from_millis(16));
+                        } else if s.is_busy() {
+                            *awaiting_read = true;
+                            ctx.request_repaint_after(Duration::from_millis(16));
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                            self.status_log =
+                                String::from("MEASUREMENT ERROR: Spyder worker disconnected");
+                            self.phase = AppPhase::Dashboard;
+                        }
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                        self.status_log = String::from("MEASUREMENT ERROR: Spyder session offline");
+                        self.phase = AppPhase::Dashboard;
+                    }
+                } else {
+                    // Poll non-blocking worker thread for completed optical measurement
+                    let poll_res = if let Some(s) = &mut self.session {
+                        s.poll_measure()
+                    } else {
+                        Some(Err(String::from("Spyder session disconnected")))
                     };
 
-                    match read_res {
-                        Ok(reading) => {
+                    match poll_res {
+                        Some(Ok(raw_reading)) => {
+                            let reading = if current_ccmx {
+                                raw_reading.apply_ccmx(current_display.ccmx_matrix())
+                            } else {
+                                raw_reading
+                            };
                             readings.push((spec, reading));
                             *current_index += 1;
                             if *current_index >= patches.len() {
@@ -2076,10 +2405,14 @@ impl eframe::App for YutaniApp {
                                 ctx.request_repaint();
                             }
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                            self.status_log = format!("MEASUREMENT ERROR ON {}: {e:#}", spec.label);
+                            self.status_log = format!("MEASUREMENT ERROR ON {}: {e}", spec.label);
                             self.phase = AppPhase::Dashboard;
+                        }
+                        None => {
+                            // Still integrating on the background worker thread; keep UI responsive
+                            ctx.request_repaint_after(Duration::from_millis(16));
                         }
                     }
                 }
@@ -2089,8 +2422,10 @@ impl eframe::App for YutaniApp {
                 measurements,
                 vcgt_summary,
                 saved_paths,
+                install_status,
             } => {
                 let mut back_to_dash = false;
+                let mut trigger_install = false;
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.heading("YUTANI WAYLAND // CALIBRATION TELEMETRY REPORT");
@@ -2308,17 +2643,42 @@ impl eframe::App for YutaniApp {
                         for p in saved_paths.iter() {
                             ui.monospace(format!("  -> {}", p.display()));
                         }
+                        if let Some(status) = install_status.as_ref() {
+                            ui.monospace(format!("  WAYLAND / COLORD INSTALL: {status}"));
+                        }
                         ui.label(
                             "KWin Wayland: System Settings -> Display & Monitor -> Display Configuration -> Color Profile -> Assign ICC Profile.",
                         );
 
                         ui.add_space(12.0);
-                        if ui.button(" [ RETURN TO YUTANI CONSOLE ] ").clicked() {
-                            back_to_dash = true;
-                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .button(" [ INSTALL TO ~/.local/share/icc & REGISTER WITH COLORD ] ")
+                                .clicked()
+                            {
+                                trigger_install = true;
+                            }
+                            if ui.button(" [ RETURN TO YUTANI CONSOLE ] ").clicked() {
+                                back_to_dash = true;
+                            }
+                        });
                     });
                 });
 
+                if trigger_install {
+                    if let Some(first_path) = saved_paths.first() {
+                        match install_and_register_icc_profile(first_path, current_display) {
+                            Ok(msg) => {
+                                self.status_log = msg.clone();
+                                *install_status = Some(msg);
+                            }
+                            Err(err) => {
+                                self.status_log = format!("ICC INSTALL ERROR: {err}");
+                                *install_status = Some(format!("ERROR: {err}"));
+                            }
+                        }
+                    }
+                }
                 if back_to_dash {
                     self.phase = AppPhase::Dashboard;
                 }

@@ -3,6 +3,8 @@
 //! SpyderX-family protocol, independently reimplemented in Rust from
 //! publicly documented device behaviour (see docs/protocol-notes.md).
 
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -103,6 +105,8 @@ pub struct XyzReading {
     pub raw_counts: [u16; 3],
     /// Secondary 16-bit sensor channel counts (channels 3..6 on SpyderX2 / SpyderPro).
     pub secondary_raw_counts: [u16; 3],
+    /// Secondary CIE XYZ tristimulus decoded via the secondary 3x3 calibration matrix.
+    pub secondary_xyz: [f64; 3],
     /// Net counts after subtracting setup_off and black offset.
     pub net_counts: [f64; 3],
     /// Number of hardware samples averaged into this reading.
@@ -309,9 +313,12 @@ impl SpyderSession {
             calibrated_ch[i] = (net / g) + self.offset[i];
         }
 
+        let mut secondary_ch = [0.0f64; 3];
         if resp.len() >= 17 {
             for i in 0..3 {
-                secondary_raw_counts[i] = u16::from_be_bytes([resp[11 + i * 2], resp[12 + i * 2]]);
+                let sraw = u16::from_be_bytes([resp[11 + i * 2], resp[12 + i * 2]]);
+                secondary_raw_counts[i] = sraw;
+                secondary_ch[i] = (sraw as f64 - self.secondary_setup_off[i]).max(0.0);
             }
         }
 
@@ -328,12 +335,26 @@ impl SpyderSession {
             + self.matrix[2][2] * calibrated_ch[2])
             .max(0.0);
 
+        let sec_x = (self.secondary_matrix[0][0] * secondary_ch[0]
+            + self.secondary_matrix[0][1] * secondary_ch[1]
+            + self.secondary_matrix[0][2] * secondary_ch[2])
+            .max(0.0);
+        let sec_y = (self.secondary_matrix[1][0] * secondary_ch[0]
+            + self.secondary_matrix[1][1] * secondary_ch[1]
+            + self.secondary_matrix[1][2] * secondary_ch[2])
+            .max(0.0);
+        let sec_z = (self.secondary_matrix[2][0] * secondary_ch[0]
+            + self.secondary_matrix[2][1] * secondary_ch[1]
+            + self.secondary_matrix[2][2] * secondary_ch[2])
+            .max(0.0);
+
         Ok(XyzReading {
             x,
             y,
             z,
             raw_counts,
             secondary_raw_counts,
+            secondary_xyz: [sec_x, sec_y, sec_z],
             net_counts,
             sample_count: 1,
         })
@@ -360,6 +381,7 @@ impl SpyderSession {
         let mut sum_x = first.x;
         let mut sum_y = first.y;
         let mut sum_z = first.z;
+        let mut sum_sec_xyz = first.secondary_xyz;
         let mut sum_net = first.net_counts;
         let mut sum_raw = [
             first.raw_counts[0] as u32,
@@ -373,6 +395,7 @@ impl SpyderSession {
             sum_y += r.y;
             sum_z += r.z;
             for c in 0..3 {
+                sum_sec_xyz[c] += r.secondary_xyz[c];
                 sum_net[c] += r.net_counts[c];
                 sum_raw[c] += r.raw_counts[c] as u32;
             }
@@ -389,9 +412,197 @@ impl SpyderSession {
                 ((sum_raw[2] as f64) * inv).round() as u16,
             ],
             secondary_raw_counts: first.secondary_raw_counts,
+            secondary_xyz: [
+                sum_sec_xyz[0] * inv,
+                sum_sec_xyz[1] * inv,
+                sum_sec_xyz[2] * inv,
+            ],
             net_counts: [sum_net[0] * inv, sum_net[1] * inv, sum_net[2] * inv],
             sample_count: total,
         })
+    }
+}
+
+enum WorkerCmd {
+    Measure { dark_averaging: bool },
+    CalibrateBlack,
+}
+
+enum WorkerReply {
+    Measured(Result<XyzReading, String>),
+    BlackCalibrated(Result<[f64; 3], String>),
+}
+
+/// Non-blocking handle to a dedicated background thread owning a [`SpyderSession`].
+/// Keeps the Wayland / `egui` UI responsive at full frame rate during 714ms+ USB reads.
+pub struct SpyderWorker {
+    cmd_tx: Sender<WorkerCmd>,
+    reply_rx: Receiver<WorkerReply>,
+    in_flight: bool,
+    pub vid_pid: (u16, u16),
+    pub cmd_set: CmdSet,
+    pub model_name: &'static str,
+    pub firmware_version: String,
+    pub serial_number: String,
+    pub integration_ms: u16,
+    pub matrix: [[f64; 3]; 3],
+    pub secondary_matrix: [[f64; 3]; 3],
+    pub setup_off: [f64; 3],
+    pub secondary_setup_off: [f64; 3],
+    pub black_off: [f64; 3],
+    pub black_calibrated: bool,
+}
+
+impl SpyderWorker {
+    /// Open a [`SpyderSession`] on a dedicated background worker thread.
+    pub fn spawn() -> Result<Self> {
+        let (init_tx, init_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+        let (reply_tx, reply_rx) = mpsc::channel::<WorkerReply>();
+
+        thread::spawn(move || {
+            let mut session = match SpyderSession::open() {
+                Ok(s) => {
+                    let meta = (
+                        s.vid_pid,
+                        s.cmd_set,
+                        s.model_name,
+                        s.firmware_version.clone(),
+                        s.serial_number.clone(),
+                        s.integration_ms,
+                        s.matrix,
+                        s.secondary_matrix,
+                        s.setup_off,
+                        s.secondary_setup_off,
+                    );
+                    let _ = init_tx.send(Ok(meta));
+                    s
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(format!("{e:#}")));
+                    return;
+                }
+            };
+
+            while let Ok(cmd) = cmd_rx.recv() {
+                match cmd {
+                    WorkerCmd::Measure { dark_averaging } => {
+                        let res = session
+                            .measure_adaptive(dark_averaging)
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = reply_tx.send(WorkerReply::Measured(res));
+                    }
+                    WorkerCmd::CalibrateBlack => {
+                        let res = session.calibrate_black().map_err(|e| format!("{e:#}"));
+                        let _ = reply_tx.send(WorkerReply::BlackCalibrated(res));
+                    }
+                }
+            }
+        });
+
+        let (
+            vid_pid,
+            cmd_set,
+            model_name,
+            firmware_version,
+            serial_number,
+            integration_ms,
+            matrix,
+            secondary_matrix,
+            setup_off,
+            secondary_setup_off,
+        ) = init_rx
+            .recv()
+            .context("sensor worker thread terminated unexpectedly")?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        Ok(Self {
+            cmd_tx,
+            reply_rx,
+            in_flight: false,
+            vid_pid,
+            cmd_set,
+            model_name,
+            firmware_version,
+            serial_number,
+            integration_ms,
+            matrix,
+            secondary_matrix,
+            setup_off,
+            secondary_setup_off,
+            black_off: [0.0; 3],
+            black_calibrated: false,
+        })
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.in_flight
+    }
+
+    /// Trigger a non-blocking optical measurement on the worker thread.
+    pub fn request_measure(&mut self, dark_averaging: bool) -> bool {
+        if self.in_flight {
+            return false;
+        }
+        if self
+            .cmd_tx
+            .send(WorkerCmd::Measure { dark_averaging })
+            .is_ok()
+        {
+            self.in_flight = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Poll for a completed optical measurement without blocking the UI thread.
+    pub fn poll_measure(&mut self) -> Option<Result<XyzReading, String>> {
+        if !self.in_flight {
+            return None;
+        }
+        match self.reply_rx.try_recv() {
+            Ok(WorkerReply::Measured(res)) => {
+                self.in_flight = false;
+                Some(res)
+            }
+            Ok(WorkerReply::BlackCalibrated(res)) => {
+                self.in_flight = false;
+                if let Ok(bcal) = res {
+                    self.black_off = bcal;
+                    self.black_calibrated = true;
+                }
+                None
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.in_flight = false;
+                Some(Err(String::from("Spyder worker thread disconnected")))
+            }
+        }
+    }
+
+    /// Perform dark-current zeroing (`bcal`) on the worker thread.
+    pub fn calibrate_black_sync(&mut self) -> Result<[f64; 3], String> {
+        // Drain any stale in-flight reply first
+        if self.in_flight {
+            let _ = self.reply_rx.recv();
+            self.in_flight = false;
+        }
+        self.cmd_tx
+            .send(WorkerCmd::CalibrateBlack)
+            .map_err(|_| String::from("Spyder worker thread disconnected"))?;
+        match self.reply_rx.recv() {
+            Ok(WorkerReply::BlackCalibrated(res)) => {
+                if let Ok(bcal) = res {
+                    self.black_off = bcal;
+                    self.black_calibrated = true;
+                }
+                res
+            }
+            Ok(WorkerReply::Measured(_)) => Err(String::from("unexpected worker reply")),
+            Err(_) => Err(String::from("Spyder worker thread disconnected")),
+        }
     }
 }
 
@@ -685,6 +896,7 @@ pub fn probe() -> Result<()> {
                     z,
                     raw_counts: raw,
                     secondary_raw_counts: sec_raw,
+                    secondary_xyz: [0.0; 3],
                     net_counts: ch,
                     sample_count: 1,
                 };

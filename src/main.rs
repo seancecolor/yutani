@@ -38,6 +38,9 @@ enum Command {
         /// Use IEC 61966-2-1 sRGB piecewise curve
         #[arg(long)]
         srgb: bool,
+        /// Disable panel-specific 3x3 CCMX spectral colorimeter compensation
+        #[arg(long)]
+        no_ccmx: bool,
     },
 }
 
@@ -61,6 +64,7 @@ fn main() -> Result<()> {
                 gamma,
                 pure_power,
                 srgb,
+                no_ccmx,
             } => {
                 let target_display = icc::DisplayTarget::from_cli_str(&display);
                 let target_gamut = icc::ColorGamut::from_cli_str(&gamut);
@@ -79,11 +83,20 @@ fn main() -> Result<()> {
                 );
                 match driver::spyder::SpyderSession::open() {
                     Ok(session) => {
-                        let reading = session.measure()?;
+                        let raw_reading = session.measure_adaptive(true)?;
+                        let reading = if no_ccmx {
+                            raw_reading
+                        } else {
+                            raw_reading.apply_ccmx(target_display.ccmx_matrix())
+                        };
                         let (x, y, lum) = reading.to_xyy();
                         println!(
-                            "Measured current screen: {:.3} cd/m² (CIE xy = {:.4}, {:.4})",
-                            lum, x, y
+                            "Measured current screen: {:.3} cd/m² (CIE xy = {:.4}, {:.4}, samples = {}, CCMX = {})",
+                            lum,
+                            x,
+                            y,
+                            reading.sample_count,
+                            if no_ccmx { "OFF" } else { target_display.ccmx_label() }
                         );
                         let white_lum = if lum > 5.0 {
                             lum
