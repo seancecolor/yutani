@@ -827,6 +827,130 @@ fn install_and_register_icc_profile(
     ))
 }
 
+/// Build the default custom export path (`~/Documents/<filename>.icc` or `~/<filename>.icc`).
+fn default_icc_export_path(source_profile: &std::path::Path) -> String {
+    let fname = source_profile
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("yutani_calibrated.icc");
+    if let Ok(home) = std::env::var("HOME") {
+        let home_dir = PathBuf::from(&home);
+        let docs_dir = home_dir.join("Documents");
+        if docs_dir.is_dir() {
+            return docs_dir.join(fname).to_string_lossy().into_owned();
+        }
+        return home_dir.join(fname).to_string_lossy().into_owned();
+    }
+    String::from(fname)
+}
+
+/// Open a native KDE Plasma (`kdialog`) or FreeDesktop (`zenity`) Save File dialog to let the
+/// user pick where to save a copy of the `.icc` profile. Returns `Ok(Some(path))` if a destination
+/// was chosen, `Ok(None)` if the user canceled the dialog, or `Err` if neither dialog tool is installed.
+fn pick_icc_save_path_native_dialog(default_path: &str) -> Result<Option<PathBuf>, String> {
+    // 1. Try KDE Plasma native `kdialog --getsavefilename`
+    if let Ok(out) = std::process::Command::new("kdialog")
+        .arg("--title")
+        .arg("Yutani — Save ICC Color Profile Copy")
+        .arg("--getsavefilename")
+        .arg(default_path)
+        .arg("ICC Color Profiles (*.icc *.icm)")
+        .output()
+    {
+        if out.status.success() {
+            let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !chosen.is_empty() {
+                return Ok(Some(PathBuf::from(chosen)));
+            }
+        }
+        return Ok(None);
+    }
+
+    // 2. Fallback to GTK/GNOME `zenity --file-selection --save`
+    if let Ok(out) = std::process::Command::new("zenity")
+        .arg("--file-selection")
+        .arg("--save")
+        .arg("--confirm-overwrite")
+        .arg("--title=Yutani — Save ICC Color Profile Copy")
+        .arg(format!("--filename={default_path}"))
+        .arg("--file-filter=ICC Color Profiles (*.icc, *.icm) | *.icc *.icm")
+        .output()
+    {
+        if out.status.success() {
+            let chosen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !chosen.is_empty() {
+                return Ok(Some(PathBuf::from(chosen)));
+            }
+        }
+        return Ok(None);
+    }
+
+    Err(String::from(
+        "Neither 'kdialog' nor 'zenity' found on PATH; use the Custom Save Path box below.",
+    ))
+}
+
+/// Copy the generated `.icc` profile to a user-specified file or directory path (expanding leading `~/`)
+/// and return the canonical/resolved destination `PathBuf`.
+fn save_icc_profile_copy(
+    source_profile: &std::path::Path,
+    raw_dest: &str,
+) -> Result<PathBuf, String> {
+    let trimmed = raw_dest.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("Destination path is empty."));
+    }
+
+    // Expand leading `~/` to `$HOME/`
+    let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+        let home =
+            std::env::var("HOME").map_err(|_| String::from("HOME environment variable not set"))?;
+        PathBuf::from(home).join(rest)
+    } else if trimmed == "~" {
+        let home =
+            std::env::var("HOME").map_err(|_| String::from("HOME environment variable not set"))?;
+        PathBuf::from(home)
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    let source_fname = source_profile
+        .file_name()
+        .ok_or_else(|| String::from("Invalid source ICC profile filename"))?;
+
+    // If destination is an existing directory or ends with `/`, append the source `.icc` filename
+    let mut final_dest = if expanded.is_dir() || trimmed.ends_with('/') {
+        expanded.join(source_fname)
+    } else {
+        expanded
+    };
+
+    // Ensure `.icc` or `.icm` extension is present
+    let has_icc_ext = final_dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let lower = e.to_ascii_lowercase();
+            lower == "icc" || lower == "icm"
+        })
+        .unwrap_or(false);
+    if !has_icc_ext {
+        final_dest.set_extension("icc");
+    }
+
+    if let Some(parent) = final_dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+        }
+    }
+
+    std::fs::copy(source_profile, &final_dest)
+        .map_err(|e| format!("Failed to write ICC copy to {}: {e}", final_dest.display()))?;
+
+    Ok(final_dest)
+}
+
 /// Interval between consecutive sensor reads in Live OSD Alignment mode.
 const OSD_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -1778,6 +1902,8 @@ enum AppPhase {
         vcgt_summary: VcgtSummary,
         saved_paths: Vec<PathBuf>,
         install_status: Option<String>,
+        custom_save_path: String,
+        export_status: Option<String>,
     },
 }
 
@@ -1925,11 +2051,17 @@ impl YutaniApp {
                     "CALIBRATION COMPLETE // SAVED {} ICC PROFILE(S) WITH 3x1024 VCGT",
                     saved_paths.len()
                 );
+                let custom_save_path = saved_paths
+                    .first()
+                    .map(|p| default_icc_export_path(p))
+                    .unwrap_or_else(|| String::from("~/Documents/yutani_calibrated.icc"));
                 self.phase = AppPhase::Report {
                     measurements,
                     vcgt_summary,
                     saved_paths,
                     install_status: None,
+                    custom_save_path,
+                    export_status: None,
                 };
             }
             Err(e) => {
@@ -2745,9 +2877,13 @@ impl eframe::App for YutaniApp {
                 vcgt_summary,
                 saved_paths,
                 install_status,
+                custom_save_path,
+                export_status,
             } => {
                 let mut back_to_dash = false;
                 let mut trigger_install = false;
+                let mut trigger_browse_save = false;
+                let mut trigger_save_custom = false;
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.heading("YUTANI WAYLAND // CALIBRATION TELEMETRY REPORT");
@@ -2968,9 +3104,45 @@ impl eframe::App for YutaniApp {
                         if let Some(status) = install_status.as_ref() {
                             ui.monospace(format!("  WAYLAND / COLORD INSTALL: {status}"));
                         }
+                        if let Some(exp) = export_status.as_ref() {
+                            ui.monospace(format!("  EXPORT COPY STATUS      : {exp}"));
+                        }
                         ui.label(
                             "KWin Wayland: System Settings -> Display & Monitor -> Display Configuration -> Color Profile -> Assign ICC Profile.",
                         );
+
+                        ui.add_space(10.0);
+                        ui.label("EXPORT / SAVE A COPY OF THIS .ICC PROFILE TO CUSTOM LOCATION:");
+                        let default_fname = saved_paths
+                            .first()
+                            .and_then(|p| p.file_name())
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("yutani_calibrated.icc");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Destination Path:");
+                            let text_edit = egui::TextEdit::singleline(custom_save_path)
+                                .desired_width(440.0);
+                            ui.add(text_edit);
+                            if ui.button(" [ BROWSE... ] ").clicked() {
+                                trigger_browse_save = true;
+                            }
+                            if ui.button(" [ SAVE COPY TO PATH ] ").clicked() {
+                                trigger_save_custom = true;
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Quick Folders:");
+                            for (label, prefix) in [
+                                ("~/Desktop", "~/Desktop"),
+                                ("~/Documents", "~/Documents"),
+                                ("~/Downloads", "~/Downloads"),
+                                ("~/.local/share/icc", "~/.local/share/icc"),
+                            ] {
+                                if ui.button(format!(" [ {label} ] ")).clicked() {
+                                    *custom_save_path = format!("{prefix}/{default_fname}");
+                                }
+                            }
+                        });
 
                         ui.add_space(12.0);
                         ui.horizontal_wrapped(|ui| {
@@ -2980,12 +3152,74 @@ impl eframe::App for YutaniApp {
                             {
                                 trigger_install = true;
                             }
+                            if ui
+                                .button(" [ SAVE .ICC COPY AS... (FILE DIALOG) ] ")
+                                .clicked()
+                            {
+                                trigger_browse_save = true;
+                            }
                             if ui.button(" [ RETURN TO YUTANI CONSOLE ] ").clicked() {
                                 back_to_dash = true;
                             }
                         });
                     });
                 });
+
+                if trigger_browse_save {
+                    if let Some(first_path) = saved_paths.first().cloned() {
+                        match pick_icc_save_path_native_dialog(custom_save_path) {
+                            Ok(Some(chosen_path)) => {
+                                let chosen_str = chosen_path.to_string_lossy().into_owned();
+                                *custom_save_path = chosen_str.clone();
+                                match save_icc_profile_copy(&first_path, &chosen_str) {
+                                    Ok(final_dest) => {
+                                        if !saved_paths.contains(&final_dest) {
+                                            saved_paths.push(final_dest.clone());
+                                        }
+                                        let msg = format!(
+                                            "SAVED .ICC COPY -> {}",
+                                            final_dest.display()
+                                        );
+                                        self.status_log = msg.clone();
+                                        *export_status = Some(msg);
+                                    }
+                                    Err(err) => {
+                                        let msg = format!("SAVE ERROR: {err}");
+                                        self.status_log = msg.clone();
+                                        *export_status = Some(msg);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // User canceled native file dialog; keep current custom_save_path intact
+                            }
+                            Err(err) => {
+                                *export_status = Some(err);
+                            }
+                        }
+                    }
+                }
+
+                if trigger_save_custom {
+                    if let Some(first_path) = saved_paths.first().cloned() {
+                        match save_icc_profile_copy(&first_path, custom_save_path) {
+                            Ok(final_dest) => {
+                                *custom_save_path = final_dest.to_string_lossy().into_owned();
+                                if !saved_paths.contains(&final_dest) {
+                                    saved_paths.push(final_dest.clone());
+                                }
+                                let msg = format!("SAVED .ICC COPY -> {}", final_dest.display());
+                                self.status_log = msg.clone();
+                                *export_status = Some(msg);
+                            }
+                            Err(err) => {
+                                let msg = format!("SAVE ERROR: {err}");
+                                self.status_log = msg.clone();
+                                *export_status = Some(msg);
+                            }
+                        }
+                    }
+                }
 
                 if trigger_install {
                     if let Some(first_path) = saved_paths.first() {

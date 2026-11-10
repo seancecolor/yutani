@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# YUTANI WAYLAND DISPLAY PROFILER v0.1.6 — NOBARA / FEDORA LINUX INSTALLER
+# YUTANI WAYLAND DISPLAY PROFILER v0.1.7 — NOBARA / FEDORA LINUX INSTALLER
 # ==============================================================================
 # Builds and installs the Yutani binary, scalable CRT Amber icon, KDE Plasma /
 # Wayland .desktop launcher, Desktop shortcut, and Datacolor Spyder USB udev rules.
@@ -14,7 +14,7 @@
 #   --no-deps               Skip checking/installing Nobara dnf build packages
 #   --no-udev               Skip installing /etc/udev/rules.d/60-yutani-spyder.rules
 #   --no-desktop-shortcut   Do not place a clickable launcher icon on ~/Desktop
-#   --skip-build            Use existing target/release/yutani without cargo build
+#   --no-build, --skip-build Use existing target/release/yutani without cargo build
 #   -h, --help              Show this help message
 # ==============================================================================
 
@@ -23,7 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ID="yutani.calibration"
 BIN_NAME="yutani"
-VERSION="$(awk -F'"' '/^version *=/ { print $2; exit }' "${SCRIPT_DIR}/Cargo.toml" 2>/dev/null || echo "0.1.6")"
+VERSION="$(awk -F'"' '/^version *=/ { print $2; exit }' "${SCRIPT_DIR}/Cargo.toml" 2>/dev/null || echo "0.1.7")"
 
 UPDATE_MODE=0
 SYSTEM_INSTALL=0
