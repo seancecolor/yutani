@@ -1,0 +1,12 @@
+# Yutani Wayland Display Profiler — USB permissions for Datacolor Spyder instruments
+# Installed to /etc/udev/rules.d/60-yutani-spyder.rules on Nobara / Fedora Linux.
+# Grants non-root access to the active desktop session via systemd-logind uaccess.
+
+# Datacolor SpyderX (085c:0a00)
+SUBSYSTEM=="usb", ATTR{idVendor}=="085c", ATTR{idProduct}=="0a00", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Datacolor SpyderX2 Elite / Ultra (085c:0a0a)
+SUBSYSTEM=="usb", ATTR{idVendor}=="085c", ATTR{idProduct}=="0a0a", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Datacolor Spyder / SpyderPro 2024 (085c:0a0b)
+SUBSYSTEM=="usb", ATTR{idVendor}=="085c", ATTR{idProduct}=="0a0b", MODE="0660", GROUP="plugdev", TAG+="uaccess"

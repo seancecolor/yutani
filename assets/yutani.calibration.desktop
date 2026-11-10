@@ -1,0 +1,30 @@
+[Desktop Entry]
+Version=1.5
+Type=Application
+Name=Yutani Display Profiler
+GenericName=Wayland Monitor Calibration Tool
+Comment=Wayland-native monitor color calibration and 3x1024 VCGT ICC profiler for Datacolor SpyderX2 & SpyderPro
+Exec=yutani
+TryExec=yutani
+Icon=yutani
+Terminal=false
+Categories=Graphics;Settings;HardwareSettings;Monitor;
+Keywords=color;calibration;icc;wayland;spyder;spyderx2;spyderpro;oled;display;lut;vcgt;
+StartupNotify=true
+StartupWMClass=yutani.calibration
+Actions=UpdateApp;DetectSensor;ProbeCalibration;
+
+[Desktop Action UpdateApp]
+Name=Update Yutani (Git Pull & Rebuild)
+Exec=sh -c '__YUTANI_REPO_DIR__/install-nobara.sh --update; read -p "Press Enter to close..."'
+Terminal=true
+
+[Desktop Action DetectSensor]
+Name=Detect USB Colorimeter (CLI)
+Exec=sh -c 'yutani detect --all; read -p "Press Enter to close..."'
+Terminal=true
+
+[Desktop Action ProbeCalibration]
+Name=Probe Sensor Calibration Matrix (CLI)
+Exec=sh -c 'yutani probe; read -p "Press Enter to close..."'
+Terminal=true

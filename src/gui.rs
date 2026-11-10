@@ -21,6 +21,8 @@ pub fn run_gui() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("yutani.calibration")
+            .with_title("YUTANI // COLORIMETRY SUBSYSTEM")
+            .with_icon(std::sync::Arc::new(build_yutani_window_icon()))
             .with_inner_size([960.0, 680.0])
             .with_fullscreen(false),
         follow_system_theme: false,
@@ -36,6 +38,65 @@ pub fn run_gui() -> eframe::Result<()> {
             Box::new(YutaniApp::new())
         }),
     )
+}
+
+/// Generate a crisp 64x64 RGBA window icon matching `assets/yutani.svg` (CRT amber chassis,
+/// CIE gamut triangle, and Spyder optical aperture crosshair).
+fn build_yutani_window_icon() -> egui::IconData {
+    let w = 64usize;
+    let h = 64usize;
+    let mut rgba = vec![0u8; w * h * 4];
+    let cx = 31.5_f32;
+    let cy = 33.0_f32;
+
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) * 4;
+            let fx = x as f32;
+            let fy = y as f32;
+
+            // Rounded outer CRT bezel (60x60 inside 64x64)
+            if x < 2 || x >= 62 || y < 2 || y >= 62 {
+                continue;
+            }
+            let border = x <= 3 || x >= 60 || y <= 3 || y >= 60;
+            let dx = fx - cx;
+            let dy = fy - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            let (r, g, b, a) = if border {
+                (255, 180, 40, 255)
+            } else if (dist - 14.5).abs() <= 1.2 {
+                // Outer amber sensor reticle ring
+                (255, 180, 40, 255)
+            } else if (dist - 7.5).abs() <= 1.0 {
+                // Inner cyan optical aperture ring
+                (90, 235, 190, 255)
+            } else if dist <= 2.2 {
+                // D65 whitepoint center dot
+                (255, 244, 208, 255)
+            } else if (dx.abs() <= 0.8 && dy.abs() <= 11.0)
+                || (dy.abs() <= 0.8 && dx.abs() <= 11.0)
+            {
+                // Reticle crosshair
+                (255, 180, 40, 255)
+            } else {
+                // Dark CRT phosphor background
+                (12, 10, 8, 255)
+            };
+
+            rgba[idx] = r;
+            rgba[idx + 1] = g;
+            rgba[idx + 2] = b;
+            rgba[idx + 3] = a;
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: w as u32,
+        height: h as u32,
+    }
 }
 
 fn configure_yutani_theme(ctx: &egui::Context) {
